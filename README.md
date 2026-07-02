@@ -34,6 +34,14 @@ Branch `hopper-port` ports and re-tunes the kernels for H100/sm_90
   `FlashAttentionKwargs` contract) — new `flash_attn_gqa_varlen_train`
   API, auto-routed in the HF adapter; 1.4-3.5x over per-sample loops.
 
+- **FlashAttention-compatible API** (`gemma_triton_flash_attn.fa_compat`):
+  drop-in `flash_attn_func` / `flash_attn_varlen_func` / packed variants /
+  `flash_attn_with_kvcache` with FA layouts and semantics, plus
+  `fa_compat.install()` to shim `import flash_attn` with zero code changes.
+  Overhead vs the native API: +1.7% (D=512 fwd+bwd), +8% (D=256 SWA) — the
+  irreducible FA-to-native layout copies. Unsupported FA features raise
+  loudly (dropout, softcap, ALiBi, paged KV) instead of silently degrading.
+
 Full report: [`docs/hopper_port.md`](docs/hopper_port.md).
 
 ## Results at a glance (H100, single GPU)

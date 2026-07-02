@@ -47,6 +47,8 @@ from .attention import (
     attention,
 )
 # HuggingFace transformers integration
+# FlashAttention-compatible API (drop-in for flash_attn users)
+from . import fa_compat
 from .hf_integration import (
     register_triton_attention,
     triton_gqa_attention,
@@ -71,5 +73,6 @@ __all__ = [
     "patch_transformers_5_5_4_flash_attn_key",
     "patch_gemma4_shared_kv_states_for_fsdp2",
     "patch_gemma4_image_group_ids_for_kernel",
+    "fa_compat",
     "__version__",
 ]

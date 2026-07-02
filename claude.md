@@ -49,6 +49,12 @@
 - `context/baseline.md`: 全部量化数据及复现命令
 
 **最近结论**：
+- **[2026-07-02] FlashAttention 兼容 API（第四轮 · usability）**：`flash_attn/fa_compat.py`
+  - 全套 FA 2.x 接口：flash_attn_func / varlen / qkvpacked / kvpacked / with_kvcache + `install()`（sys.modules shim，用户零代码切换）
+  - FA 语义完整映射：`(B,N,H,D)`/`(total,H,D)` layout、window_size=(left,right)→slide=left+1、softmax_scale 折进 q、bottom-right causal、cache in-place append、`deterministic=True` 强制 QS=1（bit-identical bwd，实测）
+  - 不支持项 loud raise：dropout/softcap/alibi/paged KV/ragged cache_seqlens/非 pow2 head dim
+  - 性能：`out=` 直写 FA layout（省 output copy）+ **bwd TMA gate 按 kernel 拆分**（dQ 只需 k/v contiguous → FA 输入下 dQ TMA 恢复）→ overhead vs native API：D=512 +1.7%，D=256 SWA +8%（纯 layout copy 下限）
+  - 测试 `tests/test_fa_compat.py`：FA 语义参照（含 12:4 GQA fallback、custom scale、window、kvcache append、shim import、determinism）全 PASS；全回归套件不变
 - **[2026-07-01] 五大工业 workload SOL 调优（第三轮）**：详见 `docs/workloads_sol.md`
   - Workloads: W1 packed SFT / W2 32K RAG prefill / W3 B=8 chat prefill / W4 B=32 decode / W5 MoE-26B-A4B 训练
   - **新增 split-KV decode (flash-decoding)**：decode 单遍 kernel 只有 B×H_KV=32 programs → DRAM-bound workload 23% SOL；split-KV 分块部分 softmax + combine kernel 精确合并 → **86.5% DRAM SOL**，global decode op 3.5×，W4 每 token attention 6.22→2.89ms
@@ -393,6 +399,8 @@ softcap/ALiBi/paged KV/varlen、PyPI 发布/CI/多平台支持。
 | 2026-07-01 | **greedy generation 的 token 不匹配 ≠ kernel bug**：near-tie（top-2 margin ≲ bf16 噪声）翻转后链式发散。判定标准用 teacher-forced stepwise logit parity | decode parity 实测 |
 | 2026-07-01 | **batched decode 用 split-KV 而非单遍 kernel**：B×H_KV programs 喂不饱 132 SM（DRAM-bound 23% SOL）；split-KV 到 ~264 programs → 86.5% DRAM SOL、3.5×。但 kv≤512 时两次 launch 开销反超收益（75μs vs 49μs）→ gate visible≥2048 | workloads_sol |
 | 2026-07-01 | **dQ 在 TMA 下 config space 依旧默认最优**（13 configs swept）；dQ 的 L1TEX bound 79-81% 即其天花板 | hopper_dq_tma_sweep |
+| 2026-07-02 | **3D TMA descriptor（[BQ,1,D] box 直读 FA layout Q/dO）慢 3×**：单行 box 退化 TMA 效率。代码保留（QDESC_3D constexpr）但永不自动选择；FA layout 走 q.contiguous() copy（D≥512）或 pointer bwd（D<256 情形）更快 | fa_compat 实测 |
+| 2026-07-02 | **bwd TMA gate 必须按 kernel 拆分**：dQ 只 stream K/V、dKV 只 stream Q/dO；合并 gate 会让 FA-layout 输入（q 非 contig、k/v copy 后 contig）白白丢掉 dQ 的 TMA。拆分后 compat SWA overhead 27%→8% | fa_compat 调优 |
 
 ---
 

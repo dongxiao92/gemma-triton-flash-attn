@@ -925,6 +925,16 @@ def _packed_fwd_eligible(q, k, v, has_group_ids):
     )
 
 
+def _token_major_3d(t):
+    """(B, H, N, D) logical tensor whose storage is FA-layout (B, N, H, D)
+    -> (B*N, H, D) view for 3D TMA descriptors; None if not that layout."""
+    tt = t.transpose(1, 2)
+    if tt.is_contiguous() and tt.data_ptr() % 16 == 0:
+        B, N, H, D = tt.shape
+        return tt.reshape(B * N, H, D)
+    return None
+
+
 def _launch_packed_fwd(q, k, v, output, causal, slide_size, kv_offset,
                        lse=None, BLOCK_Q=None, BLOCK_KV=None,
                        num_warps=None, num_stages=None, warp_specialize=False,
@@ -1819,6 +1829,10 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
     CuSeqlens_ptr=None,
     TOTAL_TOKENS=0,
     HAS_VARLEN: tl.constexpr = False,
+    # QDESC_3D: Q_desc/DO_desc are 3D descriptors over the (B*N, H_Q, D)
+    # view of FA-layout (B, N, H, D) tensors — lets FA-compat callers skip
+    # the q/do relayout copies. Box: [BLOCK_Q, 1, HEAD_DIM].
+    QDESC_3D: tl.constexpr = False,
 ):
     # Grid: (cdiv(SEQ_LEN, BLOCK_KV), B * N_KV_HEADS, Q_SPLITS)
     #  (varlen: (cdiv(max_seqlen, BLOCK_KV), num_seqs * N_KV_HEADS, Q_SPLITS))
@@ -1918,6 +1932,8 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
             qh_row0 = q_h_idx * TOTAL_TOKENS + seq_start
         else:
             qh_row0 = (b_idx * N_Q_HEADS + q_h_idx) * SEQ_LEN
+        # token-major row base for the 3D (B*N, H, D) descriptor layout
+        q3_row0 = b_off * SEQ_LEN + seq_start
         q_base = Q_ptr + b_off * stride_qb + q_h_idx * stride_qh + seq_start * stride_qn
         do_base = dO_ptr + b_off * stride_dob + q_h_idx * stride_doh + seq_start * stride_don
         lse_base = (LSE_ptr + b_off * stride_lseb + q_h_idx * stride_lseh
@@ -1931,8 +1947,16 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
             q_mask_local = q_offsets < seq_len
 
             if USE_TMA:
-                q_block = Q_desc.load([qh_row0 + q_start_pos, 0])
-                do_block = DO_desc.load([qh_row0 + q_start_pos, 0])
+                if QDESC_3D:
+                    q_block = Q_desc.load(
+                        [q3_row0 + q_start_pos, q_h_idx, 0]
+                    ).reshape(BLOCK_Q, HEAD_DIM)
+                    do_block = DO_desc.load(
+                        [q3_row0 + q_start_pos, q_h_idx, 0]
+                    ).reshape(BLOCK_Q, HEAD_DIM)
+                else:
+                    q_block = Q_desc.load([qh_row0 + q_start_pos, 0])
+                    do_block = DO_desc.load([qh_row0 + q_start_pos, 0])
             else:
                 q_ptrs = q_base + q_offsets[:, None] * stride_qn + d_range[None, :] * stride_qd
                 q_block = tl.load(q_ptrs, mask=q_mask_local[:, None], other=0.0)
@@ -2204,7 +2228,8 @@ def _flash_attn_gqa_bwd_dk_only_kernel(
 
 class FlashAttnGQAFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, causal, slide_size, group_ids, group_lo, group_hi_excl):
+    def forward(ctx, q, k, v, causal, slide_size, group_ids, group_lo,
+                group_hi_excl, deterministic=False, out=None):
         B, H_Q, N, D = q.shape
         _, H_KV, N_KV, _ = k.shape
         assert N_KV == N, (
@@ -2212,7 +2237,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             "cross-length (KV cache) attention is inference-only — use "
             "flash_attn_gqa_train under no_grad or attention_flash_gqa directly"
         )
-        output = torch.empty_like(q)
+        output = torch.empty_like(q) if out is None else out
         lse = torch.empty(B, H_Q, N, dtype=torch.float32, device=q.device)
 
         # Normalize: window covering the whole sequence ≡ full causal.
@@ -2229,6 +2254,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             ctx.causal = causal
             ctx.slide_size = slide_size
             ctx.has_group_ids = has_group_ids
+            ctx.deterministic = deterministic
             return output
 
         BLOCK_Q = 64 if D >= 512 else 128
@@ -2271,6 +2297,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         ctx.causal = causal
         ctx.slide_size = slide_size
         ctx.has_group_ids = has_group_ids
+        ctx.deterministic = deterministic
         return output
 
     @staticmethod
@@ -2299,15 +2326,31 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         # TMA descriptors for the streamed operands (Hopper): K/V for the dQ
         # kernel, Q/dO for the dKV kernel. Same size gate as the forward —
         # ~20us host-side launch cost regresses small SWA kernels.
-        use_tma_bwd = (
+        tma_ok = (
             not _TENSOR_DESC_UNAVAILABLE
             and (D >= 512 or N >= 8192)
             and torch.cuda.get_device_capability(q.device)[0] >= 9
             and q.dtype in (torch.float16, torch.bfloat16)
             and D in (64, 128, 256, 512)
-            and all(t.is_contiguous() and t.data_ptr() % 16 == 0
-                    for t in (q, k, v, do))
         )
+        # dQ streams K/V; dKV streams Q/dO — gate each on its own operands
+        # (FA-layout callers give strided q/do but contiguous k/v).
+        use_tma_dq = tma_ok and all(
+            t.is_contiguous() and t.data_ptr() % 16 == 0 for t in (k, v))
+        q_ours = q.is_contiguous() and q.data_ptr() % 16 == 0
+        # 3D-descriptor mode ([BQ, 1, D] boxes over FA-layout Q/dO) is
+        # implemented but measured 3x SLOWER than pointer loads on H100
+        # (degenerate single-row TMA boxes) — never auto-selected.
+        q3 = None
+        do3 = None
+        if tma_ok and not q_ours and q3 is not None:
+            do3 = _token_major_3d(do)
+        use_tma_dkv = tma_ok and (q_ours or (q3 is not None and do3 is not None))
+        qdesc_3d = use_tma_dkv and not q_ours
+        if use_tma_dkv and not qdesc_3d and not do.is_contiguous():
+            do = do.contiguous()  # copy only when it unlocks the TMA path
+        if use_tma_dkv and not qdesc_3d:
+            use_tma_dkv = do.is_contiguous() and do.data_ptr() % 16 == 0
 
         # --- dQ kernel ---
         # D-specific tuning (sweeps in context/baseline.md):
@@ -2321,7 +2364,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         BLOCK_KV_BW = max(16, min(BLOCK_KV_BW, triton.next_power_of_2(N)))
         grid_dq = (triton.cdiv(N, BLOCK_Q_BW), B * H_Q)
 
-        if use_tma_bwd:
+        if use_tma_dq:
             kd_dq = TensorDescriptor.from_tensor(
                 k.reshape(B * H_KV * N, D), block_shape=[BLOCK_KV_BW, D])
             vd_dq = TensorDescriptor.from_tensor(
@@ -2348,7 +2391,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
             stride_gb=g_strides_dq[0], stride_gn=g_strides_dq[1],
             HAS_GROUP_IDS=has_group_ids,
-            K_desc=kd_dq, V_desc=vd_dq, USE_TMA=use_tma_bwd,
+            K_desc=kd_dq, V_desc=vd_dq, USE_TMA=use_tma_dq,
             num_warps=num_warps_bw, num_stages=2,
         )
 
@@ -2364,7 +2407,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         # The old split path (_flash_attn_gqa_bwd_dkv_kernel with expand+reduce)
         # is kept in the source for reference but no longer on the hot path.
         if D >= 512:
-            if use_tma_bwd:
+            if use_tma_dkv:
                 # TMA re-sweep on H100 (hopper port, N=8K E2B): TMA frees the
                 # address registers that made BKV=32 spill catastrophically
                 # (20.5ms pointer-loads -> 6.5ms TMA); beats the BKV=16
@@ -2378,10 +2421,10 @@ class FlashAttnGQAFunction(torch.autograd.Function):
                 # which cuts the inner Q loop 4× and reuses each Q/dO tile better.
                 BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 16, 64, 4
                 num_stages_dkv = 2
-        elif use_tma_bwd:
+        elif use_tma_dkv:
             # TMA re-sweep on H100 (hopper port): small resident KV tile +
             # streamed Q/dO via TMA beats the big-tile config (0.247 vs
-            # 0.288ms @ E2B SWA N=8K). use_tma_bwd implies N >= 8192 here,
+            # 0.288ms @ E2B SWA N=8K). the TMA gate implies N >= 8192 here,
             # so the short-N grid-starvation regime never reaches this arm.
             BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 64, 4
             num_stages_dkv = 2
@@ -2420,6 +2463,8 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         # QS>1 is net-negative by ~5-15%.
         raw_grid_dkv = triton.cdiv(N, BLOCK_KV_DKV) * B * H_KV
         target_grid = 128 if BLOCK_KV_DKV == 64 else 256
+        if getattr(ctx, "deterministic", False):
+            raw_grid_dkv = target_grid  # forces Q_SPLITS=1 (no atomics)
         if raw_grid_dkv >= target_grid:
             Q_SPLITS_DKV = 1
         elif raw_grid_dkv * 2 >= target_grid:
@@ -2444,7 +2489,12 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             dk = torch.empty_like(k)
             dv = torch.empty_like(v)
 
-        if use_tma_bwd:
+        if use_tma_dkv and qdesc_3d:
+            qd_dkv = TensorDescriptor.from_tensor(
+                q3, block_shape=[BLOCK_Q_DKV, 1, D])
+            dod_dkv = TensorDescriptor.from_tensor(
+                do3, block_shape=[BLOCK_Q_DKV, 1, D])
+        elif use_tma_dkv:
             qd_dkv = TensorDescriptor.from_tensor(
                 q.reshape(B * H_Q * N, D), block_shape=[BLOCK_Q_DKV, D])
             dod_dkv = TensorDescriptor.from_tensor(
@@ -2472,15 +2522,17 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
             stride_gb=g_strides_dq[0], stride_gn=g_strides_dq[1],
             HAS_GROUP_IDS=has_group_ids,
-            Q_desc=qd_dkv, DO_desc=dod_dkv, USE_TMA=use_tma_bwd,
+            Q_desc=qd_dkv, DO_desc=dod_dkv, USE_TMA=use_tma_dkv,
+            QDESC_3D=qdesc_3d,
             num_warps=num_warps_dkv, num_stages=num_stages_dkv,
         )
 
-        return dq, dk, dv, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 
 def flash_attn_gqa_train(q, k, v, causal=False, slide_size=0,
-                         group_ids=None, group_lo=None, group_hi_excl=None):
+                         group_ids=None, group_lo=None, group_hi_excl=None,
+                         deterministic=False, out=None):
     """Flash Attention GQA with backward pass support for training.
 
     Args:
@@ -2509,6 +2561,7 @@ def flash_attn_gqa_train(q, k, v, causal=False, slide_size=0,
         return attention_flash_gqa(q, k, v, causal=causal, slide_size=slide_size)
     return FlashAttnGQAFunction.apply(
         q, k, v, causal, slide_size, group_ids, group_lo, group_hi_excl,
+        deterministic, out,
     )
 
 
@@ -2544,7 +2597,8 @@ def _varlen_eligible(q, k, v):
 
 class FlashAttnGQAVarlenFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, cu_seqlens, max_seqlen, causal, slide_size):
+    def forward(ctx, q, k, v, cu_seqlens, max_seqlen, causal, slide_size,
+                deterministic=False, out=None):
         B, H_Q, T, D = q.shape
         _, H_KV, T_K, _ = k.shape
         assert B == 1, "varlen packing expects a (1, H, total_tokens, D) stream"
@@ -2561,7 +2615,7 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
         if slide_size > 0 and slide_size >= max_seqlen:
             slide_size = 0
 
-        output = torch.empty_like(q)
+        output = torch.empty_like(q) if out is None else out
         lse = torch.empty(1, H_Q, T, dtype=torch.float32, device=q.device)
         _launch_packed_fwd(q, k, v, output, causal, slide_size, 0, lse=lse,
                            cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
@@ -2570,6 +2624,7 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
         ctx.max_seqlen = max_seqlen
         ctx.causal = causal
         ctx.slide_size = slide_size
+        ctx.deterministic = deterministic
         return output
 
     @staticmethod
@@ -2584,16 +2639,31 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
         scale = 1.0 / math.sqrt(D)
         GQA_RATIO = H_Q // H_KV
 
-        do = do.contiguous() if not do.is_contiguous() else do
         delta = torch.empty(1, H_Q, T, dtype=torch.float32, device=q.device)
         dq = torch.empty_like(q)
 
-        use_tma_bwd = (
+        tma_ok = (
             not _TENSOR_DESC_UNAVAILABLE
             and (D >= 512 or T >= 8192)
-            and q.is_contiguous() and do.is_contiguous()
-            and q.data_ptr() % 16 == 0 and do.data_ptr() % 16 == 0
         )
+        # k/v were normalized to contiguous by the varlen entry point;
+        # FA-layout callers may still hand us strided q/do.
+        use_tma_dq = tma_ok and all(
+            t.is_contiguous() and t.data_ptr() % 16 == 0 for t in (k, v))
+        q_ours = q.is_contiguous() and q.data_ptr() % 16 == 0
+        # 3D-descriptor mode ([BQ, 1, D] boxes over FA-layout Q/dO) is
+        # implemented but measured 3x SLOWER than pointer loads on H100
+        # (degenerate single-row TMA boxes) — never auto-selected.
+        q3 = None
+        do3 = None
+        if tma_ok and not q_ours and q3 is not None:
+            do3 = _token_major_3d(do)
+        use_tma_dkv = tma_ok and (q_ours or (q3 is not None and do3 is not None))
+        qdesc_3d = use_tma_dkv and not q_ours
+        if use_tma_dkv and not qdesc_3d and not do.is_contiguous():
+            do = do.contiguous()  # copy only when it unlocks the TMA path
+        if use_tma_dkv and not qdesc_3d:
+            use_tma_dkv = do.is_contiguous() and do.data_ptr() % 16 == 0
 
         # --- dQ (same tuned configs as the dense path) ---
         if D >= 512:
@@ -2604,7 +2674,7 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
         BLOCK_KV_BW = max(16, min(BLOCK_KV_BW, triton.next_power_of_2(max_seqlen)))
         grid_dq = (triton.cdiv(max_seqlen, BLOCK_Q_BW), num_seqs * H_Q)
 
-        if use_tma_bwd:
+        if use_tma_dq:
             kd_dq = TensorDescriptor.from_tensor(
                 k.reshape(H_KV * T, D), block_shape=[BLOCK_KV_BW, D])
             vd_dq = TensorDescriptor.from_tensor(
@@ -2629,18 +2699,18 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
             STORE_DELTA=True,
             GroupIds_ptr=None, GroupLo_ptr=None, GroupHi_ptr=None,
             stride_gb=0, stride_gn=0, HAS_GROUP_IDS=False,
-            K_desc=kd_dq, V_desc=vd_dq, USE_TMA=use_tma_bwd,
+            K_desc=kd_dq, V_desc=vd_dq, USE_TMA=use_tma_dq,
             CuSeqlens_ptr=cu_seqlens, TOTAL_TOKENS=T, HAS_VARLEN=True,
             num_warps=num_warps_bw, num_stages=2,
         )
 
         # --- dK/dV (packed, per-sequence bounds) ---
         if D >= 512:
-            if use_tma_bwd:
+            if use_tma_dkv:
                 BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv, num_stages_dkv = 32, 64, 8, 2
             else:
                 BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv, num_stages_dkv = 16, 64, 4, 2
-        elif use_tma_bwd:
+        elif use_tma_dkv:
             BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv, num_stages_dkv = 32, 64, 4, 2
         else:
             BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv, num_stages_dkv = 32, 64, 4, 2
@@ -2649,6 +2719,8 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
 
         raw_grid_dkv = triton.cdiv(max_seqlen, BLOCK_KV_DKV) * num_seqs * H_KV
         target_grid = 128 if BLOCK_KV_DKV == 64 else 256
+        if getattr(ctx, "deterministic", False):
+            raw_grid_dkv = target_grid  # forces Q_SPLITS=1 (no atomics)
         if raw_grid_dkv >= target_grid:
             Q_SPLITS_DKV = 1
         elif raw_grid_dkv * 2 >= target_grid:
@@ -2668,7 +2740,12 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
             dk = torch.empty_like(k)
             dv = torch.empty_like(v)
 
-        if use_tma_bwd:
+        if use_tma_dkv and qdesc_3d:
+            qd_dkv = TensorDescriptor.from_tensor(
+                q3, block_shape=[BLOCK_Q_DKV, 1, D])
+            dod_dkv = TensorDescriptor.from_tensor(
+                do3, block_shape=[BLOCK_Q_DKV, 1, D])
+        elif use_tma_dkv:
             qd_dkv = TensorDescriptor.from_tensor(
                 q.reshape(H_Q * T, D), block_shape=[BLOCK_Q_DKV, D])
             dod_dkv = TensorDescriptor.from_tensor(
@@ -2694,16 +2771,18 @@ class FlashAttnGQAVarlenFunction(torch.autograd.Function):
             Q_SPLITS=Q_SPLITS_DKV,
             GroupIds_ptr=None, GroupLo_ptr=None, GroupHi_ptr=None,
             stride_gb=0, stride_gn=0, HAS_GROUP_IDS=False,
-            Q_desc=qd_dkv, DO_desc=dod_dkv, USE_TMA=use_tma_bwd,
+            Q_desc=qd_dkv, DO_desc=dod_dkv, USE_TMA=use_tma_dkv,
             CuSeqlens_ptr=cu_seqlens, TOTAL_TOKENS=T, HAS_VARLEN=True,
+            QDESC_3D=qdesc_3d,
             num_warps=num_warps_dkv, num_stages=num_stages_dkv,
         )
 
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None
 
 
 def flash_attn_gqa_varlen_train(q, k, v, cu_seqlens, max_seqlen=None,
-                                causal=True, slide_size=0):
+                                causal=True, slide_size=0,
+                                deterministic=False, out=None):
     """Padding-free (varlen / multi-sample packing) attention with autograd.
 
     Args:
@@ -2732,7 +2811,7 @@ def flash_attn_gqa_varlen_train(q, k, v, cu_seqlens, max_seqlen=None,
     if not v.is_contiguous():
         v = v.contiguous()
     return FlashAttnGQAVarlenFunction.apply(
-        q, k, v, cu, int(max_seqlen), causal, slide_size,
+        q, k, v, cu, int(max_seqlen), causal, slide_size, deterministic, out,
     )
 
 

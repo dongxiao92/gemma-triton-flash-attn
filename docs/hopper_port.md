@@ -179,7 +179,36 @@ Same story as §2: the memory-bound dQ kernel exceeds 70% SOL; fwd/dKV
 sit at the documented 1-CTA/SM occupancy ceiling. Reproduce:
 `benchmarks/varlen_bench.py`, `benchmarks/hopper_ncu_sol.py vbwd512 4096 4`.
 
-## 4. What did NOT need porting
+## 4. FlashAttention-compatible API (2026-07-02, usability round)
+
+`flash_attn/fa_compat.py` makes switching from flash-attention 2.x
+zero-cost for user code: `flash_attn_func`, `flash_attn_varlen_func`,
+the qkv/kv-packed variants and `flash_attn_with_kvcache` with FA's exact
+layouts ((B, N, H, D) / (total, H, D)) and semantics (window_size,
+softmax_scale, bottom-right-aligned causal, in-place cache append,
+deterministic backward). `fa_compat.install()` shims
+`sys.modules["flash_attn"]` so even `import flash_attn` works unchanged.
+Unsupported FA features (dropout, softcap, ALiBi, paged KV, ragged
+cache_seqlens) raise NotImplementedError — never silent wrong results.
+
+Perf work to avoid regression through the layout boundary: the kernels
+write the output directly into FA-layout memory through an `out=` target
+(no output copy); the backward TMA gate was split per kernel (dQ streams
+only K/V — which the compat layer hands over contiguous — so dQ keeps its
+TMA path even with strided FA-layout q/do); a 3D-descriptor mode reading
+FA-layout Q/dO directly was implemented but measured 3x slower
+(degenerate [BQ,1,D] TMA boxes) and is never auto-selected. Result,
+fwd+bwd overhead vs the native API on E2B shapes @ N=8K: **+1.7%
+(D=512), +8% (D=256 SWA)** — the residual is the irreducible q/do
+relayout copies (D=512) and pointer-mode backward (D=256).
+
+Tests: `tests/test_fa_compat.py` validates against references computed in
+FA semantics — dense fwd+bwd (incl. non-pow2-ratio GQA 12:4 via the
+classic fallback, custom scale, windows, MHA non-causal), packed
+variants, varlen packing fwd+bwd, kvcache decode with append,
+deterministic bit-identical backward, and the import shim.
+
+## 5. What did NOT need porting
 
 - All equal-length kernel functionality (incl. D=512) worked on sm_90
   as-is with triton 3.5.1 — the old tuning (block sizes, warps, stages,
