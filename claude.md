@@ -18,7 +18,8 @@
 
 ## 项目状态
 
-**当前阶段**：**✅ Ship-ready（继续迭代中）** (2026-04-17)
+**当前阶段**：**✅ Hopper (H100/sm_90) port 完成 + 优化** (2026-07-01, branch `hopper-port`)
+> 详见 `docs/hopper_port.md`。上一阶段：✅ Ship-ready (2026-04-17)
 
 **最终交付指标**（H100 80GB, BF16）：
 | 场景 | Speedup vs SDPA | 备注 |
@@ -48,6 +49,15 @@
 - `context/baseline.md`: 全部量化数据及复现命令
 
 **最近结论**：
+- **[2026-07-01] Hopper port + 优化完成**（computelab H100 80GB, torch 2.9.1 + triton 3.5.1 + transformers 5.5.4）：
+  - **"global attention D=512 不支持" 未复现**：所有 equal-length kernel（含 D=512 至 N=32K）在 sm_90 直接通过；真正坏的是 **`model.generate()` decode 路径**（q_len=1 vs kv_len=t → BLOCK clamp 到 1 < tl.dot 最小 16 → CompilationError）
+  - 修复：fwd kernel 加 `KV_OFFSET`（q 为 KV 流后缀）+ BLOCK ≥ 16 clamp；`flash_attn_gqa_train` 将 cross-length 调用路由到 inference kernel
+  - gemma-4-E2B-it 全部功能验证过：adapter 28/28、prefill logits cos 0.99998 / top-1 100% (N=512/4096)、teacher-forced decode parity 24/24 无翻转
+  - 优化（fwd: pack-GQA + TMA descriptor + 3-phase loop；bwd: TMA streamed operands + dKV retune (BKV=32,BQ=64,w=8)）：
+    - E2B fwd D=512 N=8K: 3.10→2.61ms；fwd+bwd N=8K: 16.0→13.4ms；SWA fwd+bwd N=16K: 1.39→1.07ms
+    - F config fwd+bwd vs SDPA: 2.9→3.3× @1K, 2.8→3.4× @4K, 2.5→3.0× @16K
+    - NCU SOL: dQ D=512 **75.6%** Memory（>70% 目标达成），dKV/fwd D=512 60%（L1TEX 61-68%），其余见 `docs/hopper_port.md`
+  - 环境注意：compute node 不能写 $HOME → `TRITON_CACHE_DIR` 必须指向 scratch
 - **[2026-04-18] 长 N (8K-32K) E2E 扩展数据**：
   - **合成 Gemma4 stack 训练 fwd+bwd** (d_model=2048)：
     - N=8K: **3.12×**, N=16K: **3.82×**, N=32K: **4.39×** vs SDPA
@@ -360,6 +370,14 @@ softcap/ALiBi/paged KV/varlen、PyPI 发布/CI/多平台支持。
 | 2026-04-17 | **Python overhead 在短 N 显著，长 N 被 GPU work 掩盖**：Config B N=1K 101μs vs N=4K 36μs。原因：kernel launch CPU 部分在短 N 与 GPU 部分同量级，无法 overlap | alloc_overhead.py 观察 |
 | 2026-04-17 | **Python overhead 分解**（Config B N=1K）：kernel launch 2 次 Python wrapper ~40μs（可被 GPU work 掩盖）、torch.autograd.Function 框架 ~80μs（**不可掩盖**，CPU-exclusive）、alloc 20μs。80μs autograd 开销无法在 Triton 3.x + 不改 API 的前提下优化 | triton_launch_overhead.py 量化 |
 | 2026-04-17 | **2 个 bwd kernel 背靠背启动比孤立启动快 -36μs**：证明 Python launch overhead 可以被 GPU work overlap 掩盖（pipeline），不是瓶颈。瓶颈是 autograd.Function 纯 CPU 框架路径 | 实测 |
+| 2026-07-01 | **H100 上 num_warps=16 全灭**：Triton 强制 128 reg/thread cap → 大量 spill（25ms vs 3ms），部分 config PTX codegen internal error。不要再试 | hopper_fwd_packed_sweep |
+| 2026-07-01 | **`tl.range(warp_specialize=True)` 在 sm_90 是 no-op**（triton 3.5.1 与 3.7.1 均验证，1.00-1.02×）。WS 只对 Blackwell 生效 | bench 实测 |
+| 2026-07-01 | **TMA 启动 host 开销 ~20-25μs/call**（tensormap 转换在 launcher），短 N SWA kernel 会净回退 → packed/TMA 路径 gate: D≥512 or N_KV≥8192 | tier-1 对比 |
+| 2026-07-01 | **TMA 免地址寄存器 → dKV BKV=32 翻案**：pointer-load 时代 BKV=32 w=8 灾难 spill (20.5ms)，TMA 后 6.5ms 反超 BKV=16 default 28%。旧 "BKV=16 最优" 结论只对 pointer load 成立 | hopper_bwd_tma_sweep |
+| 2026-07-01 | **E2B (H_KV=1) fwd 在 H100 不是 HBM bound**：K/V 全进 L2（DRAM 1-2%），真瓶颈 L1TEX/smem (wgmma operand reads) + 1 CTA/SM occupancy。旧 "84-90% HBM" 结论只对 H_KV≥4 长 N 成立 | NCU |
+| 2026-07-01 | **Triton 3.5 sm_90 的 occupancy 硬顶**：fp32 acc (BQ×512) + 192KB smem → 1 CTA/SM、2 warps/scheduler、issue 0.45/cyc。FA3 式 warp-spec/pingpong 不可表达，fwd/dKV D=512 SOL 停在 60-68% | NCU + 实验矩阵 |
+| 2026-07-01 | **triton `//` 对负数是 trunc（C 语义）不是 floor**：3-phase loop 边界公式必须保持除数非负，否则 SWA unmasked 区间越界（曾致 cos 0.78） | debug 实录 |
+| 2026-07-01 | **greedy generation 的 token 不匹配 ≠ kernel bug**：near-tie（top-2 margin ≲ bf16 噪声）翻转后链式发散。判定标准用 teacher-forced stepwise logit parity | decode parity 实测 |
 
 ---
 

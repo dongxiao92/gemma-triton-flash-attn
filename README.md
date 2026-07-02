@@ -11,6 +11,26 @@ Covers both **Gemma-4-E2B (dense)** and **Gemma-4-26B-A4B (MoE)** attention
 shapes — the MoE router is upstream of attention, so the kernel sees the
 same Q/K/V tensors and only the head counts / window size differ.
 
+## Hopper port (2026-07)
+
+Branch `hopper-port` ports and re-tunes the kernels for H100/sm_90
+(computelab, torch 2.9.1 + triton 3.5.1):
+
+- **KV-cache decode support**: `model.generate()` previously crashed on the
+  first decode step (q_len=1 vs kv_len=t — no cross-length support, block
+  clamp below `tl.dot`'s minimum). The fwd kernel now takes a `KV_OFFSET`
+  (q = suffix of the KV stream); greedy generation matches SDPA
+  (teacher-forced stepwise parity: 24/24 steps, logits cos >= 0.99998).
+- **Hopper fwd kernel**: pack-GQA (K/V loaded once per GQA group) + TMA
+  tensor descriptors + 3-phase KV loop → D=512 fwd −16%, fwd+bwd −16%
+  @ N=8K; F-config fwd+bwd vs SDPA 2.9→3.3× @1K, 2.8→3.4× @4K.
+- **Hopper bwd**: TMA streamed operands in dQ/dKV; dKV retuned
+  (BKV=32,BQ=64,w=8 under TMA) → SWA fwd+bwd @16K −23%.
+- NCU Speed-of-Light: dQ D=512 at **75.6%** (target >70%); fwd/dKV D=512
+  at ~60% — remaining gap is a Triton-3.5-on-sm_90 occupancy ceiling.
+
+Full report: [`docs/hopper_port.md`](docs/hopper_port.md).
+
 ## Results at a glance (H100, single GPU)
 
 | Benchmark | Config | Peak speedup / saving |
