@@ -27,7 +27,7 @@ from typing import NamedTuple
 
 import torch
 
-from .attention import flash_attn_gqa_train
+from .attention import flash_attn_gqa_train, flash_attn_gqa_varlen_train
 
 
 # =====================================================================
@@ -144,6 +144,38 @@ def triton_gqa_attention(
 
     slide = int(sliding_window) if sliding_window else 0
     is_causal = getattr(module, "is_causal", True)
+
+    # Padding-free / multi-sample packing path (DataCollatorWithFlattening
+    # with return_flash_attn_kwargs=True): transformers forwards
+    # FlashAttentionKwargs through the attention interface. Tokens must not
+    # attend across sample boundaries — route to the varlen kernel.
+    cu_q = kwargs.get("cu_seq_lens_q", None)
+    cu_k = kwargs.get("cu_seq_lens_k", None)
+    if cu_q is not None or cu_k is not None:
+        cu = cu_q if cu_q is not None else cu_k
+        if cu_q is not None and cu_k is not None \
+                and cu_q.data_ptr() != cu_k.data_ptr() \
+                and not torch.equal(cu_q, cu_k):
+            raise NotImplementedError(
+                "triton_gqa_attention varlen requires cu_seq_lens_q == "
+                "cu_seq_lens_k (self-attention packing, no KV cache)"
+            )
+        if query.shape[2] != key.shape[2]:
+            raise NotImplementedError(
+                "packed varlen attention with a KV cache is not supported"
+            )
+        if _image_group_state.get() is not None:
+            raise NotImplementedError(
+                "image-bidirectional mask is not supported with packed varlen"
+            )
+        max_len = kwargs.get("max_length_q", None) or kwargs.get("max_length_k", None)
+        with torch.cuda.device(query.device):
+            out = flash_attn_gqa_varlen_train(
+                query, key, value, cu,
+                max_seqlen=int(max_len) if max_len is not None else None,
+                causal=is_causal, slide_size=slide,
+            )
+        return out.transpose(1, 2).contiguous(), None
 
     # Image-bidirectional mask path (Gemma-4 MoE multimodal training):
     # Sliding layers get an OR-mask that grants bidirectional attention

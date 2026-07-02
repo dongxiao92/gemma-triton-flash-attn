@@ -9,6 +9,8 @@ Runs one attention op a few times so ncu can profile it. Usage:
        python benchmarks/hopper_ncu_sol.py bwd512 8192
 
 Targets: fwd512 | fwd256swa | bwd512 | bwd256swa   (E2B shapes, H_Q=8, H_KV=1)
+Varlen targets (packed N_SEQS x LEN): vfwd512 | vfwd256swa | vbwd512 | vbwd256swa
+  e.g. python benchmarks/hopper_ncu_sol.py vbwd512 4096 4   (4 samples of 4096)
 """
 import os
 import sys
@@ -25,7 +27,22 @@ slide = 512 if "swa" in which else 0
 torch.manual_seed(0)
 dt = torch.float16
 
-if which.startswith("fwd"):
+if which.startswith("v"):
+    from flash_attn.attention import flash_attn_gqa_varlen_train
+    n_seqs = int(sys.argv[3]) if len(sys.argv) > 3 else 4
+    T = n_seqs * N
+    cu = torch.arange(0, T + 1, N, dtype=torch.int32, device="cuda")
+    rg = "bwd" in which
+    q = torch.randn(1, 8, T, D, dtype=dt, device="cuda", requires_grad=rg)
+    k = torch.randn(1, 1, T, D, dtype=dt, device="cuda", requires_grad=rg)
+    v = torch.randn(1, 1, T, D, dtype=dt, device="cuda", requires_grad=rg)
+    for _ in range(3):
+        out = flash_attn_gqa_varlen_train(q, k, v, cu, N, causal=True,
+                                          slide_size=slide)
+        if rg:
+            out.backward(torch.randn_like(out))
+            q.grad = k.grad = v.grad = None
+elif which.startswith("fwd"):
     q = torch.randn(1, 8, N, D, dtype=dt, device="cuda")
     k = torch.randn(1, 1, N, D, dtype=dt, device="cuda")
     v = torch.randn(1, 1, N, D, dtype=dt, device="cuda")

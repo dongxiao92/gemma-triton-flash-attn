@@ -137,7 +137,49 @@ the E2E impact is small.
 Reproduce: `benchmarks/hopper_ncu_sol.py` (NCU at
 `/home/scratch.xiaod_sw/dynamic-kernel-generator/cuda-12.9.83-20250520/ncu`).
 
-## 3. What did NOT need porting
+## 3. Varlen / multi-sample packing (2026-07-01, follow-up)
+
+Padding-free packing — multiple samples concatenated into one
+`(1, H, total_tokens, D)` stream with `cu_seqlens` boundaries, tokens
+never attending across samples — was previously unsupported: the HF
+adapter silently dropped transformers' `FlashAttentionKwargs`
+(`cu_seq_lens_q/k`, `max_length_q/k` from `DataCollatorWithFlattening`),
+which would have produced cross-document attention.
+
+Implementation: `HAS_VARLEN` constexpr specialization in the three
+production kernels (fwd packed, dQ, dKV packed) — `program_id(1)` maps to
+(sequence, head), all mask/window math stays in per-sequence local
+coordinates, pointer/descriptor math shifts by `seq_start`, blocks past a
+sequence's length exit early. New public API
+`flash_attn_gqa_varlen_train(q, k, v, cu_seqlens, max_seqlen, causal,
+slide_size)`; the adapter routes automatically when `cu_seq_lens_*`
+kwargs are present. K/V are normalized to contiguous (TMA descriptor
+flattening); requires sm_90.
+
+Correctness (`tests/test_varlen_packing.py`): packed output and
+dq/dk/dv match the per-sample dense kernel bit-for-bit on the fwd/dq
+path (max diff 0) and within accumulation tolerance on dk/dv, across
+mixed lengths (incl. 3-token samples), D=512 causal / D=256 SWA, fp16 +
+bf16, GQA 8:1 and 2:1, plus the adapter-level FlashAttentionKwargs
+contract.
+
+Throughput vs looping the dense kernel per sample (fp16, E2B shapes):
+1.4-1.8x fwd+bwd at D=512 (4-8 samples of 2K), 1.9-3.5x on sliding
+layers. NCU on packed workloads matches the dense SOL profile — the
+varlen specialization adds no measurable overhead:
+
+| kernel (varlen, packed 4x4096) | Compute SOL | Memory SOL | L1/TEX |
+|---|---|---|---|
+| **dQ D=512** | 29.4% | **77.2%** | **80.1%** |
+| fwd D=512 | 40.9% | 63.3% | 67.6% |
+| dKV D=512 | 33.9% | 55.2% | 58.6% |
+| fwd D=256 SWA (8x4096) | 41.0% | 38.7% | 40.6% |
+
+Same story as §2: the memory-bound dQ kernel exceeds 70% SOL; fwd/dKV
+sit at the documented 1-CTA/SM occupancy ceiling. Reproduce:
+`benchmarks/varlen_bench.py`, `benchmarks/hopper_ncu_sol.py vbwd512 4096 4`.
+
+## 4. What did NOT need porting
 
 - All equal-length kernel functionality (incl. D=512) worked on sm_90
   as-is with triton 3.5.1 — the old tuning (block sizes, warps, stages,

@@ -29,6 +29,11 @@ Branch `hopper-port` ports and re-tunes the kernels for H100/sm_90
 - NCU Speed-of-Light: dQ D=512 at **75.6%** (target >70%); fwd/dKV D=512
   at ~60% — remaining gap is a Triton-3.5-on-sm_90 occupancy ceiling.
 
+- **Varlen / multi-sample packing**: padding-free packed streams with
+  `cu_seqlens` boundaries (transformers `DataCollatorWithFlattening` /
+  `FlashAttentionKwargs` contract) — new `flash_attn_gqa_varlen_train`
+  API, auto-routed in the HF adapter; 1.4-3.5x over per-sample loops.
+
 Full report: [`docs/hopper_port.md`](docs/hopper_port.md).
 
 ## Results at a glance (H100, single GPU)

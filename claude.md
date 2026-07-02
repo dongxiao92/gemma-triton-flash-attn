@@ -49,6 +49,13 @@
 - `context/baseline.md`: 全部量化数据及复现命令
 
 **最近结论**：
+- **[2026-07-01] Varlen / multi-sample packing 支持落地**：
+  - 之前 adapter 静默丢弃 transformers 的 FlashAttentionKwargs（cu_seq_lens_q/k）→ packing 输入会跨文档 attention
+  - 三个生产 kernel 加 `HAS_VARLEN` constexpr（program_id(1) = (seq, head)，mask 全部 per-seq local 坐标，指针/descriptor 移 seq_start，越界 block 早退）
+  - 新 API `flash_attn_gqa_varlen_train`；adapter 检测 cu_seq_lens kwargs 自动路由（DataCollatorWithFlattening 兼容）
+  - 正确性 `tests/test_varlen_packing.py`：packed vs per-sample dense 全 PASS（fwd/dq bit-exact；混合长度含 3-token 样本、fp16+bf16、8:1+2:1）
+  - 吞吐 vs per-sample 循环：D=512 fwd+bwd 1.4-1.8×，SWA 1.9-3.5×；NCU SOL 与 dense 一致（varlen dQ D=512 **77.2%** >70% 目标；fwd 63%，dKV 55% 同 occupancy 天花板）
+  - 注意：HF 传入的 k/v 是 transpose view 非 contiguous → varlen wrapper 内部 .contiguous()（TMA descriptor 需要）
 - **[2026-07-01] Hopper port + 优化完成**（computelab H100 80GB, torch 2.9.1 + triton 3.5.1 + transformers 5.5.4）：
   - **"global attention D=512 不支持" 未复现**：所有 equal-length kernel（含 D=512 至 N=32K）在 sm_90 直接通过；真正坏的是 **`model.generate()` decode 路径**（q_len=1 vs kv_len=t → BLOCK clamp 到 1 < tl.dot 最小 16 → CompilationError）
   - 修复：fwd kernel 加 `KV_OFFSET`（q 为 KV 流后缀）+ BLOCK ≥ 16 clamp；`flash_attn_gqa_train` 将 cross-length 调用路由到 inference kernel

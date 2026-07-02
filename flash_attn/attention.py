@@ -506,6 +506,14 @@ def _flash_attn_gqa_fwd_packed_kernel(
     STORE_LSE: tl.constexpr,
     KV_OFFSET=0,
     WARP_SPECIALIZE: tl.constexpr = False,
+    # Varlen / multi-sample packing (padding-free): q/k/v are (1, H, T, D)
+    # packed streams; CuSeqlens_ptr is int32 (num_seqs+1) cumulative token
+    # offsets; program_id(1) indexes (seq, kv_head) instead of (batch,
+    # kv_head); SEQ_LEN is max_seqlen (grid sizing only). KV_OFFSET must
+    # be 0 (no KV cache with packing).
+    CuSeqlens_ptr=None,
+    TOTAL_TOKENS=0,
+    HAS_VARLEN: tl.constexpr = False,
 ):
     QPOS: tl.constexpr = BLOCK_Q // GQA_RATIO
     q_block_idx = tl.program_id(0)
@@ -516,16 +524,31 @@ def _flash_attn_gqa_fwd_packed_kernel(
     row = tl.arange(0, BLOCK_Q)
     q_pos = q_block_idx * QPOS + row // GQA_RATIO
     q_head = kv_h_idx * GQA_RATIO + row % GQA_RATIO
-    q_mask = q_pos < SEQ_LEN
     d_range = tl.arange(0, HEAD_DIM)
 
-    q_row_base = Q_ptr + b_idx * stride_qb + q_head * stride_qh + q_pos * stride_qn
-    o_row_base = O_ptr + b_idx * stride_ob + q_head * stride_oh + q_pos * stride_on
+    if HAS_VARLEN:
+        # b_idx is the sequence index; all q/kv coordinates below stay in
+        # LOCAL (per-sequence) space, only pointer/descriptor math shifts
+        # by seq_start. Blocks past this sequence's length exit early.
+        seq_start = tl.load(CuSeqlens_ptr + b_idx)
+        q_len = tl.load(CuSeqlens_ptr + b_idx + 1) - seq_start
+        if q_block_idx * QPOS >= q_len:
+            return
+        b_off = 0                      # packed batch dim is 1
+        kv_row0 = kv_h_idx * TOTAL_TOKENS + seq_start
+    else:
+        seq_start = 0
+        q_len = SEQ_LEN
+        b_off = b_idx
+        kv_row0 = bkvh_idx * (SEQ_LEN + KV_OFFSET)
 
-    KV_SEQ_LEN = SEQ_LEN + KV_OFFSET
-    # Row offset of this (batch, kv_head) in the flattened (B*H_KV*N_KV, D)
-    # descriptor view.
-    kv_row0 = bkvh_idx * KV_SEQ_LEN
+    q_mask = q_pos < q_len
+    q_row_base = (Q_ptr + b_off * stride_qb + q_head * stride_qh
+                  + (seq_start + q_pos) * stride_qn)
+    o_row_base = (O_ptr + b_off * stride_ob + q_head * stride_oh
+                  + (seq_start + q_pos) * stride_on)
+
+    KV_SEQ_LEN = q_len + KV_OFFSET
 
     # All KV coordinates below are absolute positions in the KV stream;
     # q row i attends around position i + KV_OFFSET.
@@ -645,8 +668,8 @@ def _flash_attn_gqa_fwd_packed_kernel(
     if STORE_LSE:
         LN2: tl.constexpr = 0.6931471805599453
         lse = m_i * LN2 + tl.log(l_i)
-        lse_ptrs = (LSE_ptr + b_idx * stride_lseb + q_head * stride_lseh
-                    + q_pos * stride_lsen)
+        lse_ptrs = (LSE_ptr + b_off * stride_lseb + q_head * stride_lseh
+                    + (seq_start + q_pos) * stride_lsen)
         tl.store(lse_ptrs, lse, mask=q_mask)
 
 
@@ -677,8 +700,14 @@ def _packed_fwd_eligible(q, k, v, has_group_ids):
 
 def _launch_packed_fwd(q, k, v, output, causal, slide_size, kv_offset,
                        lse=None, BLOCK_Q=None, BLOCK_KV=None,
-                       num_warps=None, num_stages=None, warp_specialize=False):
-    """Launch the pack-GQA + TMA forward kernel. Caller checked eligibility."""
+                       num_warps=None, num_stages=None, warp_specialize=False,
+                       cu_seqlens=None, max_seqlen=None):
+    """Launch the pack-GQA + TMA forward kernel. Caller checked eligibility.
+
+    Varlen mode (cu_seqlens not None): q/k/v are packed (1, H, T, D)
+    streams; grid covers (cdiv(max_seqlen, QPOS), num_seqs * H_KV) and
+    kv_offset must be 0.
+    """
     B, H_Q, N, D = q.shape
     _, H_KV, N_KV, _ = k.shape
     ratio = H_Q // H_KV
@@ -700,12 +729,20 @@ def _launch_packed_fwd(q, k, v, output, causal, slide_size, kv_offset,
         v.reshape(B * H_KV * N_KV, D), block_shape=[BLOCK_KV, D])
 
     store_lse = lse is not None
-    grid = (triton.cdiv(N, qpos), B * H_KV)
+    has_varlen = cu_seqlens is not None
+    if has_varlen:
+        assert kv_offset == 0, "varlen packing does not support KV cache"
+        num_seqs = cu_seqlens.numel() - 1
+        grid = (triton.cdiv(max_seqlen, qpos), num_seqs * H_KV)
+        seq_len_arg, total_tokens = max_seqlen, N
+    else:
+        grid = (triton.cdiv(N, qpos), B * H_KV)
+        seq_len_arg, total_tokens = N, 0
     _flash_attn_gqa_fwd_packed_kernel[grid](
         q, k_desc, v_desc, output,
         q.stride(0), q.stride(1), q.stride(2), q.stride(3),
         output.stride(0), output.stride(1), output.stride(2), output.stride(3),
-        N_KV_HEADS=H_KV, SEQ_LEN=N, HEAD_DIM=D,
+        N_KV_HEADS=H_KV, SEQ_LEN=seq_len_arg, HEAD_DIM=D,
         scale=1.0 / math.sqrt(D),
         BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV, GQA_RATIO=ratio,
         IS_CAUSAL=causal, SLIDE_SIZE=slide_size,
@@ -716,6 +753,9 @@ def _launch_packed_fwd(q, k, v, output, causal, slide_size, kv_offset,
         STORE_LSE=store_lse,
         KV_OFFSET=kv_offset,
         WARP_SPECIALIZE=warp_specialize,
+        CuSeqlens_ptr=cu_seqlens,
+        TOTAL_TOKENS=total_tokens,
+        HAS_VARLEN=has_varlen,
         num_warps=num_warps, num_stages=num_stages,
     )
     return output
@@ -1086,22 +1126,40 @@ def _flash_attn_gqa_bwd_dq_kernel(
     K_desc=None,
     V_desc=None,
     USE_TMA: tl.constexpr = False,
+    # Varlen / multi-sample packing — see _flash_attn_gqa_fwd_packed_kernel.
+    CuSeqlens_ptr=None,
+    TOTAL_TOKENS=0,
+    HAS_VARLEN: tl.constexpr = False,
 ):
     q_block_idx = tl.program_id(0)
     bh_idx = tl.program_id(1)
     q_h_idx = bh_idx % N_Q_HEADS
     b_idx = bh_idx // N_Q_HEADS
     kv_h_idx = q_h_idx * N_KV_HEADS // N_Q_HEADS
-    kv_row0 = (b_idx * N_KV_HEADS + kv_h_idx) * SEQ_LEN
 
-    q_base = Q_ptr + b_idx * stride_qb + q_h_idx * stride_qh
-    k_base = K_ptr + b_idx * stride_kb + kv_h_idx * stride_kh
-    v_base = V_ptr + b_idx * stride_vb + kv_h_idx * stride_vh
-    do_base = dO_ptr + b_idx * stride_dob + q_h_idx * stride_doh
-    dq_base = dQ_ptr + b_idx * stride_dqb + q_h_idx * stride_dqh
+    if HAS_VARLEN:
+        # b_idx is the sequence index; coordinates stay per-sequence LOCAL,
+        # pointer/descriptor math shifts by seq_start.
+        seq_start = tl.load(CuSeqlens_ptr + b_idx)
+        seq_len = tl.load(CuSeqlens_ptr + b_idx + 1) - seq_start
+        if q_block_idx * BLOCK_Q >= seq_len:
+            return
+        b_off = 0
+        kv_row0 = kv_h_idx * TOTAL_TOKENS + seq_start
+    else:
+        seq_start = 0
+        seq_len = SEQ_LEN
+        b_off = b_idx
+        kv_row0 = (b_idx * N_KV_HEADS + kv_h_idx) * SEQ_LEN
+
+    q_base = Q_ptr + b_off * stride_qb + q_h_idx * stride_qh + seq_start * stride_qn
+    k_base = K_ptr + b_off * stride_kb + kv_h_idx * stride_kh + seq_start * stride_kn
+    v_base = V_ptr + b_off * stride_vb + kv_h_idx * stride_vh + seq_start * stride_vn
+    do_base = dO_ptr + b_off * stride_dob + q_h_idx * stride_doh + seq_start * stride_don
+    dq_base = dQ_ptr + b_off * stride_dqb + q_h_idx * stride_dqh + seq_start * stride_dqn
 
     q_offsets = q_block_idx * BLOCK_Q + tl.arange(0, BLOCK_Q)
-    q_mask = q_offsets < SEQ_LEN
+    q_mask = q_offsets < seq_len
     d_range = tl.arange(0, HEAD_DIM)
 
     # Load Q, dO blocks (persist across KV iterations)
@@ -1111,15 +1169,17 @@ def _flash_attn_gqa_bwd_dq_kernel(
     do_block = tl.load(do_ptrs, mask=q_mask[:, None], other=0.0)
 
     # Load LSE and Delta for this Q block
-    lse_ptrs = LSE_ptr + b_idx * stride_lseb + q_h_idx * stride_lseh + q_offsets * stride_lsen
+    lse_ptrs = (LSE_ptr + b_off * stride_lseb + q_h_idx * stride_lseh
+                + (seq_start + q_offsets) * stride_lsen)
     lse = tl.load(lse_ptrs, mask=q_mask, other=0.0)
-    delta_ptrs = Delta_ptr + b_idx * stride_db + q_h_idx * stride_dh + q_offsets * stride_dn
+    delta_ptrs = (Delta_ptr + b_off * stride_db + q_h_idx * stride_dh
+                  + (seq_start + q_offsets) * stride_dn)
     if STORE_DELTA:
         # Fused delta: compute delta = rowsum(dO * O) in prologue, store for dKV kernel.
         # dO is already loaded; O adds ~BQ×D bytes per program (new load), but we save
         # an entire _delta_kernel launch which is otherwise launch-bound at short N
         # (32K programs of 512-byte work). Same do bandwidth, same o bandwidth, -1 launch.
-        o_base = O_ptr + b_idx * stride_ob + q_h_idx * stride_oh
+        o_base = O_ptr + b_off * stride_ob + q_h_idx * stride_oh + seq_start * stride_on
         o_ptrs = o_base + q_offsets[:, None] * stride_on + d_range[None, :] * stride_od
         o_block = tl.load(o_ptrs, mask=q_mask[:, None], other=0.0)
         delta = tl.sum(do_block.to(tl.float32) * o_block.to(tl.float32), axis=1)
@@ -1131,7 +1191,7 @@ def _flash_attn_gqa_bwd_dq_kernel(
     if IS_CAUSAL:
         kv_end = (q_block_idx + 1) * BLOCK_Q
     else:
-        kv_end = SEQ_LEN
+        kv_end = seq_len
 
     if IS_CAUSAL and SLIDE_SIZE > 0:
         kv_min = tl.maximum(0, q_block_idx * BLOCK_Q - SLIDE_SIZE + 1)
@@ -1161,7 +1221,7 @@ def _flash_attn_gqa_bwd_dq_kernel(
 
     for kv_start in range(kv_loop_start, kv_end, BLOCK_KV):
         kv_offsets = kv_start + tl.arange(0, BLOCK_KV)
-        kv_mask = kv_offsets < SEQ_LEN
+        kv_mask = kv_offsets < seq_len
 
         if USE_TMA:
             k_block = K_desc.load([kv_row0 + kv_start, 0])
@@ -1516,23 +1576,41 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
     Q_desc=None,
     DO_desc=None,
     USE_TMA: tl.constexpr = False,
+    # Varlen / multi-sample packing — see _flash_attn_gqa_fwd_packed_kernel.
+    CuSeqlens_ptr=None,
+    TOTAL_TOKENS=0,
+    HAS_VARLEN: tl.constexpr = False,
 ):
     # Grid: (cdiv(SEQ_LEN, BLOCK_KV), B * N_KV_HEADS, Q_SPLITS)
+    #  (varlen: (cdiv(max_seqlen, BLOCK_KV), num_seqs * N_KV_HEADS, Q_SPLITS))
     kv_block_idx = tl.program_id(0)
     bkvh_idx = tl.program_id(1)
     split_idx = tl.program_id(2)
     kv_h_idx = bkvh_idx % N_KV_HEADS
     b_idx = bkvh_idx // N_KV_HEADS
 
-    k_base = K_ptr + b_idx * stride_kb + kv_h_idx * stride_kh
-    v_base = V_ptr + b_idx * stride_vb + kv_h_idx * stride_vh
+    if HAS_VARLEN:
+        # b_idx is the sequence index; coordinates stay per-sequence LOCAL,
+        # pointer/descriptor math shifts by seq_start.
+        seq_start = tl.load(CuSeqlens_ptr + b_idx)
+        seq_len = tl.load(CuSeqlens_ptr + b_idx + 1) - seq_start
+        if kv_block_idx * BLOCK_KV >= seq_len:
+            return
+        b_off = 0
+    else:
+        seq_start = 0
+        seq_len = SEQ_LEN
+        b_off = b_idx
+
+    k_base = K_ptr + b_off * stride_kb + kv_h_idx * stride_kh + seq_start * stride_kn
+    v_base = V_ptr + b_off * stride_vb + kv_h_idx * stride_vh + seq_start * stride_vn
     # dK/dV indexed by KV head — one program owns this tile entirely (Q_SPLITS=1)
     # or is one of Q_SPLITS programs sharing the tile via atomic_add
-    dk_base = dK_ptr + b_idx * stride_dkb + kv_h_idx * stride_dkh
-    dv_base = dV_ptr + b_idx * stride_dvb + kv_h_idx * stride_dvh
+    dk_base = dK_ptr + b_off * stride_dkb + kv_h_idx * stride_dkh + seq_start * stride_dkn
+    dv_base = dV_ptr + b_off * stride_dvb + kv_h_idx * stride_dvh + seq_start * stride_dvn
 
     kv_offsets = kv_block_idx * BLOCK_KV + tl.arange(0, BLOCK_KV)
-    kv_mask = kv_offsets < SEQ_LEN
+    kv_mask = kv_offsets < seq_len
     d_range = tl.arange(0, HEAD_DIM)
 
     # Load K, V once — reused across all GQA_RATIO Q heads
@@ -1558,9 +1636,9 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
         kv_last = kv_block_idx * BLOCK_KV + BLOCK_KV - 1
         q_max = kv_last + SLIDE_SIZE - 1
         q_loop_end = ((q_max // BLOCK_Q) + 1) * BLOCK_Q
-        q_loop_end = tl.minimum(SEQ_LEN, q_loop_end)
+        q_loop_end = tl.minimum(seq_len, q_loop_end)
     else:
-        q_loop_end = SEQ_LEN
+        q_loop_end = seq_len
 
     # Image-group state for this KV block. Extends Q-loop bounds symmetrically
     # to fwd/dQ: any image-KV in this block is bidirectionally visible to all
@@ -1597,16 +1675,21 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
     # into the SAME dk_acc/dv_acc — this replaces the expand+reduce pattern.
     for qh_offset in tl.static_range(GQA_RATIO):
         q_h_idx = kv_h_idx * GQA_RATIO + qh_offset
-        qh_row0 = (b_idx * N_Q_HEADS + q_h_idx) * SEQ_LEN
-        q_base = Q_ptr + b_idx * stride_qb + q_h_idx * stride_qh
-        do_base = dO_ptr + b_idx * stride_dob + q_h_idx * stride_doh
-        lse_base = LSE_ptr + b_idx * stride_lseb + q_h_idx * stride_lseh
-        delta_base = Delta_ptr + b_idx * stride_db + q_h_idx * stride_dh
+        if HAS_VARLEN:
+            qh_row0 = q_h_idx * TOTAL_TOKENS + seq_start
+        else:
+            qh_row0 = (b_idx * N_Q_HEADS + q_h_idx) * SEQ_LEN
+        q_base = Q_ptr + b_off * stride_qb + q_h_idx * stride_qh + seq_start * stride_qn
+        do_base = dO_ptr + b_off * stride_dob + q_h_idx * stride_doh + seq_start * stride_don
+        lse_base = (LSE_ptr + b_off * stride_lseb + q_h_idx * stride_lseh
+                    + seq_start * stride_lsen)
+        delta_base = (Delta_ptr + b_off * stride_db + q_h_idx * stride_dh
+                      + seq_start * stride_dn)
 
         # Inner loop: Q blocks for this Q head (sliced by split_idx)
         for q_start_pos in range(q_lo, q_hi, BLOCK_Q):
             q_offsets = q_start_pos + tl.arange(0, BLOCK_Q)
-            q_mask_local = q_offsets < SEQ_LEN
+            q_mask_local = q_offsets < seq_len
 
             if USE_TMA:
                 q_block = Q_desc.load([qh_row0 + q_start_pos, 0])
@@ -2187,6 +2270,230 @@ def flash_attn_gqa_train(q, k, v, causal=False, slide_size=0,
         return attention_flash_gqa(q, k, v, causal=causal, slide_size=slide_size)
     return FlashAttnGQAFunction.apply(
         q, k, v, causal, slide_size, group_ids, group_lo, group_hi_excl,
+    )
+
+
+# =====================================================================
+# Varlen / multi-sample packing (padding-free training)
+#
+# Multiple samples are packed into one (1, H, total_tokens, D) stream;
+# cu_seqlens (int32, num_seqs+1) gives cumulative token offsets. Tokens
+# never attend across sample boundaries; causal + sliding-window masks
+# apply within each sample in LOCAL coordinates. This matches the
+# contract of transformers' DataCollatorWithFlattening /
+# FlashAttentionKwargs (cu_seq_lens_q/k, max_length_q/k).
+#
+# Runs on the pack-GQA + TMA kernels (sm_90). K/V must be contiguous
+# (descriptor flattening) — the public wrapper normalizes.
+# =====================================================================
+
+def _varlen_eligible(q, k, v):
+    B, H_Q, T, D = q.shape
+    _, H_KV, _, _ = k.shape
+    ratio = H_Q // H_KV
+    return (
+        not _TENSOR_DESC_UNAVAILABLE
+        and torch.cuda.get_device_capability(q.device)[0] >= 9
+        and H_Q == ratio * H_KV
+        and ratio in (1, 2, 4, 8, 16)
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and k.is_contiguous() and v.is_contiguous()
+        and k.data_ptr() % 16 == 0 and v.data_ptr() % 16 == 0
+        and D in (64, 128, 256, 512)
+    )
+
+
+class FlashAttnGQAVarlenFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, cu_seqlens, max_seqlen, causal, slide_size):
+        B, H_Q, T, D = q.shape
+        _, H_KV, T_K, _ = k.shape
+        assert B == 1, "varlen packing expects a (1, H, total_tokens, D) stream"
+        assert T_K == T, "varlen packing requires q_len == kv_len (no KV cache)"
+        if not _varlen_eligible(q, k, v):
+            raise NotImplementedError(
+                "varlen attention requires sm_90+, triton tensor descriptors, "
+                "fp16/bf16, contiguous k/v, and a power-of-two GQA ratio"
+            )
+        num_seqs = cu_seqlens.numel() - 1
+        assert num_seqs * H_KV <= 65535, "too many packed sequences for grid dim"
+
+        # Window covering the longest sample degenerates to full causal.
+        if slide_size > 0 and slide_size >= max_seqlen:
+            slide_size = 0
+
+        output = torch.empty_like(q)
+        lse = torch.empty(1, H_Q, T, dtype=torch.float32, device=q.device)
+        _launch_packed_fwd(q, k, v, output, causal, slide_size, 0, lse=lse,
+                           cu_seqlens=cu_seqlens, max_seqlen=max_seqlen)
+
+        ctx.save_for_backward(q, k, v, output, lse, cu_seqlens)
+        ctx.max_seqlen = max_seqlen
+        ctx.causal = causal
+        ctx.slide_size = slide_size
+        return output
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, o, lse, cu_seqlens = ctx.saved_tensors
+        max_seqlen = ctx.max_seqlen
+        causal = ctx.causal
+        slide_size = ctx.slide_size
+        B, H_Q, T, D = q.shape
+        _, H_KV, _, _ = k.shape
+        num_seqs = cu_seqlens.numel() - 1
+        scale = 1.0 / math.sqrt(D)
+        GQA_RATIO = H_Q // H_KV
+
+        do = do.contiguous() if not do.is_contiguous() else do
+        delta = torch.empty(1, H_Q, T, dtype=torch.float32, device=q.device)
+        dq = torch.empty_like(q)
+
+        use_tma_bwd = (
+            not _TENSOR_DESC_UNAVAILABLE
+            and (D >= 512 or T >= 8192)
+            and q.is_contiguous() and do.is_contiguous()
+            and q.data_ptr() % 16 == 0 and do.data_ptr() % 16 == 0
+        )
+
+        # --- dQ (same tuned configs as the dense path) ---
+        if D >= 512:
+            BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 32, 64, 8
+        else:
+            BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 64, 64, 4
+        BLOCK_Q_BW = max(16, min(BLOCK_Q_BW, triton.next_power_of_2(max_seqlen)))
+        BLOCK_KV_BW = max(16, min(BLOCK_KV_BW, triton.next_power_of_2(max_seqlen)))
+        grid_dq = (triton.cdiv(max_seqlen, BLOCK_Q_BW), num_seqs * H_Q)
+
+        if use_tma_bwd:
+            kd_dq = TensorDescriptor.from_tensor(
+                k.reshape(H_KV * T, D), block_shape=[BLOCK_KV_BW, D])
+            vd_dq = TensorDescriptor.from_tensor(
+                v.reshape(H_KV * T, D), block_shape=[BLOCK_KV_BW, D])
+        else:
+            kd_dq = vd_dq = None
+
+        _flash_attn_gqa_bwd_dq_kernel[grid_dq](
+            q, k, v, do, o, dq, lse, delta,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+            o.stride(0), o.stride(1), o.stride(2), o.stride(3),
+            dq.stride(0), dq.stride(1), dq.stride(2), dq.stride(3),
+            lse.stride(0), lse.stride(1), lse.stride(2),
+            delta.stride(0), delta.stride(1), delta.stride(2),
+            N_Q_HEADS=H_Q, N_KV_HEADS=H_KV, SEQ_LEN=max_seqlen,
+            HEAD_DIM=D, scale=scale,
+            BLOCK_Q=BLOCK_Q_BW, BLOCK_KV=BLOCK_KV_BW,
+            IS_CAUSAL=causal, SLIDE_SIZE=slide_size,
+            STORE_DELTA=True,
+            GroupIds_ptr=None, GroupLo_ptr=None, GroupHi_ptr=None,
+            stride_gb=0, stride_gn=0, HAS_GROUP_IDS=False,
+            K_desc=kd_dq, V_desc=vd_dq, USE_TMA=use_tma_bwd,
+            CuSeqlens_ptr=cu_seqlens, TOTAL_TOKENS=T, HAS_VARLEN=True,
+            num_warps=num_warps_bw, num_stages=2,
+        )
+
+        # --- dK/dV (packed, per-sequence bounds) ---
+        if D >= 512:
+            if use_tma_bwd:
+                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv, num_stages_dkv = 32, 64, 8, 2
+            else:
+                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv, num_stages_dkv = 16, 64, 4, 2
+        elif use_tma_bwd:
+            BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv, num_stages_dkv = 32, 64, 4, 2
+        else:
+            BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv, num_stages_dkv = 32, 64, 4, 2
+        BLOCK_KV_DKV = max(16, min(BLOCK_KV_DKV, triton.next_power_of_2(max_seqlen)))
+        BLOCK_Q_DKV = max(16, min(BLOCK_Q_DKV, triton.next_power_of_2(max_seqlen)))
+
+        raw_grid_dkv = triton.cdiv(max_seqlen, BLOCK_KV_DKV) * num_seqs * H_KV
+        target_grid = 128 if BLOCK_KV_DKV == 64 else 256
+        if raw_grid_dkv >= target_grid:
+            Q_SPLITS_DKV = 1
+        elif raw_grid_dkv * 2 >= target_grid:
+            Q_SPLITS_DKV = 2
+        elif raw_grid_dkv * 4 >= target_grid:
+            Q_SPLITS_DKV = 4
+        else:
+            Q_SPLITS_DKV = 8
+        grid_dkv = (triton.cdiv(max_seqlen, BLOCK_KV_DKV), num_seqs * H_KV,
+                    Q_SPLITS_DKV)
+
+        if Q_SPLITS_DKV > 1:
+            dkv = torch.empty((2,) + k.shape, dtype=k.dtype, device=k.device)
+            dkv.zero_()
+            dk, dv = dkv[0], dkv[1]
+        else:
+            dk = torch.empty_like(k)
+            dv = torch.empty_like(v)
+
+        if use_tma_bwd:
+            qd_dkv = TensorDescriptor.from_tensor(
+                q.reshape(H_Q * T, D), block_shape=[BLOCK_Q_DKV, D])
+            dod_dkv = TensorDescriptor.from_tensor(
+                do.reshape(H_Q * T, D), block_shape=[BLOCK_Q_DKV, D])
+        else:
+            qd_dkv = dod_dkv = None
+
+        _flash_attn_gqa_bwd_dkv_packed_kernel[grid_dkv](
+            q, k, v, do, dk, dv, lse, delta,
+            q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+            k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+            v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+            do.stride(0), do.stride(1), do.stride(2), do.stride(3),
+            dk.stride(0), dk.stride(1), dk.stride(2), dk.stride(3),
+            dv.stride(0), dv.stride(1), dv.stride(2), dv.stride(3),
+            lse.stride(0), lse.stride(1), lse.stride(2),
+            delta.stride(0), delta.stride(1), delta.stride(2),
+            N_Q_HEADS=H_Q, N_KV_HEADS=H_KV, SEQ_LEN=max_seqlen,
+            HEAD_DIM=D, scale=scale,
+            BLOCK_Q=BLOCK_Q_DKV, BLOCK_KV=BLOCK_KV_DKV,
+            GQA_RATIO=GQA_RATIO,
+            IS_CAUSAL=causal, SLIDE_SIZE=slide_size,
+            Q_SPLITS=Q_SPLITS_DKV,
+            GroupIds_ptr=None, GroupLo_ptr=None, GroupHi_ptr=None,
+            stride_gb=0, stride_gn=0, HAS_GROUP_IDS=False,
+            Q_desc=qd_dkv, DO_desc=dod_dkv, USE_TMA=use_tma_bwd,
+            CuSeqlens_ptr=cu_seqlens, TOTAL_TOKENS=T, HAS_VARLEN=True,
+            num_warps=num_warps_dkv, num_stages=num_stages_dkv,
+        )
+
+        return dq, dk, dv, None, None, None, None
+
+
+def flash_attn_gqa_varlen_train(q, k, v, cu_seqlens, max_seqlen=None,
+                                causal=True, slide_size=0):
+    """Padding-free (varlen / multi-sample packing) attention with autograd.
+
+    Args:
+        q: (1, N_Q_HEADS,  total_tokens, D) packed stream
+        k: (1, N_KV_HEADS, total_tokens, D)
+        v: (1, N_KV_HEADS, total_tokens, D)
+        cu_seqlens: (num_seqs + 1,) cumulative token offsets (any int dtype;
+            converted to int32 on q's device). Sample i spans
+            [cu_seqlens[i], cu_seqlens[i+1]).
+        max_seqlen: longest sample length; computed from cu_seqlens if None
+            (costs a device sync — pass it in hot loops).
+        causal / slide_size: per-sample causal & sliding-window masking; no
+            token attends across sample boundaries.
+
+    Matches the semantics transformers' DataCollatorWithFlattening expects
+    (FlashAttentionKwargs contract). Requires Hopper+ (TMA descriptors).
+    """
+    cu = cu_seqlens.to(device=q.device, dtype=torch.int32)
+    cu = cu.contiguous()
+    if max_seqlen is None:
+        max_seqlen = int((cu[1:] - cu[:-1]).max().item())
+    # TMA descriptor flattening needs contiguous K/V (HF passes transposed
+    # views — normalize here; K/V are small under GQA).
+    if not k.is_contiguous():
+        k = k.contiguous()
+    if not v.is_contiguous():
+        v = v.contiguous()
+    return FlashAttnGQAVarlenFunction.apply(
+        q, k, v, cu, int(max_seqlen), causal, slide_size,
     )
 
 
