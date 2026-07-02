@@ -673,6 +673,233 @@ def _flash_attn_gqa_fwd_packed_kernel(
         tl.store(lse_ptrs, lse, mask=q_mask)
 
 
+# =====================================================================
+# Split-KV decode (flash-decoding) — batched KV-cache decode.
+#
+# Decode calls attention with q_len=1 (a handful of rows after GQA
+# packing) against a long KV cache. The pack-GQA kernel launches only
+# B * H_KV programs there (32 for a 32-session E2B batch) — 24% of
+# H100's SMs — while the workload is pure KV streaming (DRAM-bound
+# roofline). Split-KV partitions the KV range across NUM_SPLITS
+# programs per (batch, kv_head); each computes a partial online softmax
+# (m, l, unnormalized acc) over its chunk, and a small combine kernel
+# merges the partials:  out = sum_s w_s * acc_s / sum_s w_s * l_s,
+# w_s = exp2(m_s - max_s m_s). Numerically this is the same online-
+# softmax algebra the single-pass kernel uses — no approximation.
+#
+# Inference-only (no LSE); the wrappers route eligible decode calls
+# here and fall back to the single-pass kernels otherwise.
+# =====================================================================
+
+@triton.jit
+def _flash_attn_gqa_decode_splitkv_kernel(
+    Q_ptr, K_ptr, V_ptr, Oacc_ptr, Ml_ptr,
+    stride_qb, stride_qh, stride_qn, stride_qd,
+    stride_kb, stride_kh, stride_kn, stride_kd,
+    stride_vb, stride_vh, stride_vn, stride_vd,
+    # Oacc: (B, H_KV, SPLITS, ROWS, D) fp32; Ml: (B, H_KV, SPLITS, ROWS, 2) fp32
+    stride_ob, stride_oh, stride_os, stride_or,
+    stride_mb, stride_mh, stride_ms, stride_mr,
+    N_KV_HEADS,
+    Q_LEN,
+    KV_LEN,
+    CHUNK,             # kv tokens per split (multiple of BLOCK_KV)
+    WIN_LO,            # host-computed aligned lower bound (SWA), 0 otherwise
+    scale,
+    HEAD_DIM: tl.constexpr,
+    ROWS: tl.constexpr,          # q_len * GQA_RATIO padded to >=16 pow2
+    BLOCK_KV: tl.constexpr,
+    GQA_RATIO: tl.constexpr,
+    SLIDE_SIZE: tl.constexpr,
+):
+    split_idx = tl.program_id(0)
+    bkvh_idx = tl.program_id(1)
+    kv_h_idx = bkvh_idx % N_KV_HEADS
+    b_idx = bkvh_idx // N_KV_HEADS
+
+    row = tl.arange(0, ROWS)
+    q_pos = row // GQA_RATIO                  # local q position
+    q_head = kv_h_idx * GQA_RATIO + row % GQA_RATIO
+    q_mask = q_pos < Q_LEN
+    q_abs = KV_LEN - Q_LEN + q_pos            # absolute position in cache
+    d_range = tl.arange(0, HEAD_DIM)
+
+    q_ptrs = (Q_ptr + b_idx * stride_qb + q_head[:, None] * stride_qh
+              + q_pos[:, None] * stride_qn + d_range[None, :] * stride_qd)
+    q_tile = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
+
+    k_base = K_ptr + b_idx * stride_kb + kv_h_idx * stride_kh
+    v_base = V_ptr + b_idx * stride_vb + kv_h_idx * stride_vh
+
+    chunk_lo = WIN_LO + split_idx * CHUNK
+    chunk_hi = tl.minimum(chunk_lo + CHUNK, KV_LEN)
+
+    LOG2E: tl.constexpr = 1.4426950408889634
+    scale_log2e = scale * LOG2E
+
+    m_i = tl.full([ROWS], value=-float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([ROWS], dtype=tl.float32)
+    acc = tl.zeros([ROWS, HEAD_DIM], dtype=tl.float32)
+
+    for kv_start in range(chunk_lo, chunk_hi, BLOCK_KV):
+        kv_offsets = kv_start + tl.arange(0, BLOCK_KV)
+        kv_mask = kv_offsets < KV_LEN
+        k_ptrs = k_base + kv_offsets[:, None] * stride_kn + d_range[None, :] * stride_kd
+        k_tile = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
+        scores = tl.dot(q_tile, tl.trans(k_tile)) * scale_log2e
+
+        valid = (kv_offsets[None, :] <= q_abs[:, None]) & kv_mask[None, :]
+        if SLIDE_SIZE > 0:
+            valid &= (q_abs[:, None] - kv_offsets[None, :] < SLIDE_SIZE)
+        scores = tl.where(valid, scores, -float("inf"))
+
+        block_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(m_i, block_max)
+        # chunks can be fully masked for a row (SWA edge) -> NaN clamp
+        safe_new = tl.maximum(new_max, -1e20)
+        alpha = tl.math.exp2(tl.maximum(m_i, -1e20) - safe_new)
+        p = tl.math.exp2(scores - safe_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+        v_ptrs = v_base + kv_offsets[:, None] * stride_vn + d_range[None, :] * stride_vd
+        v_tile = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
+        acc += tl.dot(p.to(v_tile.dtype), v_tile)
+        m_i = new_max
+
+    o_ptrs = (Oacc_ptr + b_idx * stride_ob + kv_h_idx * stride_oh
+              + split_idx * stride_os + row[:, None] * stride_or
+              + d_range[None, :])
+    tl.store(o_ptrs, acc)
+    ml_ptrs = (Ml_ptr + b_idx * stride_mb + kv_h_idx * stride_mh
+               + split_idx * stride_ms + row * stride_mr)
+    tl.store(ml_ptrs, m_i)
+    tl.store(ml_ptrs + 1, l_i)
+
+
+@triton.jit
+def _flash_attn_gqa_decode_combine_kernel(
+    Oacc_ptr, Ml_ptr, O_ptr,
+    stride_ob, stride_oh, stride_os, stride_or,
+    stride_mb, stride_mh, stride_ms, stride_mr,
+    stride_outb, stride_outh, stride_outn, stride_outd,
+    N_KV_HEADS,
+    Q_LEN,
+    NUM_SPLITS,
+    HEAD_DIM: tl.constexpr,
+    ROWS: tl.constexpr,
+    GQA_RATIO: tl.constexpr,
+):
+    bkvh_idx = tl.program_id(0)
+    kv_h_idx = bkvh_idx % N_KV_HEADS
+    b_idx = bkvh_idx // N_KV_HEADS
+
+    row = tl.arange(0, ROWS)
+    q_pos = row // GQA_RATIO
+    q_head = kv_h_idx * GQA_RATIO + row % GQA_RATIO
+    q_mask = q_pos < Q_LEN
+    d_range = tl.arange(0, HEAD_DIM)
+
+    # global max over splits (per row)
+    m_max = tl.full([ROWS], value=-float("inf"), dtype=tl.float32)
+    for s in range(0, NUM_SPLITS):
+        m_s = tl.load(Ml_ptr + b_idx * stride_mb + kv_h_idx * stride_mh
+                      + s * stride_ms + row * stride_mr)
+        m_max = tl.maximum(m_max, m_s)
+    m_max_safe = tl.maximum(m_max, -1e20)
+
+    l_tot = tl.zeros([ROWS], dtype=tl.float32)
+    acc = tl.zeros([ROWS, HEAD_DIM], dtype=tl.float32)
+    for s in range(0, NUM_SPLITS):
+        ml_base = (Ml_ptr + b_idx * stride_mb + kv_h_idx * stride_mh
+                   + s * stride_ms + row * stride_mr)
+        m_s = tl.load(ml_base)
+        l_s = tl.load(ml_base + 1)
+        # splits that saw no visible key (l_s == 0) contribute nothing
+        w_s = tl.where(l_s > 0, tl.math.exp2(tl.maximum(m_s, -1e20) - m_max_safe), 0.0)
+        l_tot += w_s * l_s
+        o_s = tl.load(Oacc_ptr + b_idx * stride_ob + kv_h_idx * stride_oh
+                      + s * stride_os + row[:, None] * stride_or
+                      + d_range[None, :])
+        acc += w_s[:, None] * o_s
+
+    out = acc / l_tot[:, None]
+    out_ptrs = (O_ptr + b_idx * stride_outb + q_head[:, None] * stride_outh
+                + q_pos[:, None] * stride_outn + d_range[None, :] * stride_outd)
+    tl.store(out_ptrs, out, mask=q_mask[:, None])
+
+
+def _launch_decode_splitkv(q, k, v, output, slide_size, num_splits):
+    """Split-KV decode launch. Caller checked eligibility (causal, q as
+    suffix of the KV stream, small q_len, GQA ratio divides)."""
+    B, H_Q, QL, D = q.shape
+    _, H_KV, KV_LEN, _ = k.shape
+    ratio = H_Q // H_KV
+    ROWS = max(16, triton.next_power_of_2(QL * ratio))
+    BLOCK_KV = 32 if D >= 512 else 64
+
+    if slide_size > 0:
+        win_lo = max(0, KV_LEN - QL - slide_size + 1)
+        win_lo = (win_lo // BLOCK_KV) * BLOCK_KV
+    else:
+        win_lo = 0
+    kv_range = KV_LEN - win_lo
+    chunk = triton.cdiv(triton.cdiv(kv_range, num_splits), BLOCK_KV) * BLOCK_KV
+    num_splits = triton.cdiv(kv_range, chunk)
+
+    oacc = torch.empty(B, H_KV, num_splits, ROWS, D,
+                       dtype=torch.float32, device=q.device)
+    ml = torch.empty(B, H_KV, num_splits, ROWS, 2,
+                     dtype=torch.float32, device=q.device)
+
+    grid = (num_splits, B * H_KV)
+    _flash_attn_gqa_decode_splitkv_kernel[grid](
+        q, k, v, oacc, ml,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        oacc.stride(0), oacc.stride(1), oacc.stride(2), oacc.stride(3),
+        ml.stride(0), ml.stride(1), ml.stride(2), ml.stride(3),
+        N_KV_HEADS=H_KV, Q_LEN=QL, KV_LEN=KV_LEN,
+        CHUNK=chunk, WIN_LO=win_lo,
+        scale=1.0 / math.sqrt(D),
+        HEAD_DIM=D, ROWS=ROWS, BLOCK_KV=BLOCK_KV, GQA_RATIO=ratio,
+        SLIDE_SIZE=slide_size,
+        num_warps=4, num_stages=2,
+    )
+    _flash_attn_gqa_decode_combine_kernel[(B * H_KV,)](
+        oacc, ml, output,
+        oacc.stride(0), oacc.stride(1), oacc.stride(2), oacc.stride(3),
+        ml.stride(0), ml.stride(1), ml.stride(2), ml.stride(3),
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+        N_KV_HEADS=H_KV, Q_LEN=QL, NUM_SPLITS=num_splits,
+        HEAD_DIM=D, ROWS=ROWS, GQA_RATIO=ratio,
+        num_warps=4, num_stages=1,
+    )
+    return output
+
+
+def _decode_splitkv_splits(B, H_KV, KV_LEN, QL, ratio, causal, slide_size,
+                           has_group_ids):
+    """Number of KV splits for decode, or 0 when split-KV doesn't apply.
+
+    Targets ~2 waves on 132 SMs. Only for genuine decode: causal suffix
+    query, tiny row count, long visible KV range, starved grid.
+    """
+    if has_group_ids or not causal:
+        return 0
+    if QL * ratio > 32 or ratio not in (1, 2, 4, 8, 16):
+        return 0
+    if ratio * H_KV * B == 0 or QL == 0:
+        return 0
+    visible = KV_LEN if slide_size == 0 else min(KV_LEN, slide_size + QL)
+    if visible < 2048:
+        return 0
+    programs = B * H_KV
+    if programs >= 264:
+        return 0  # grid already healthy
+    return max(1, min(264 // programs, triton.cdiv(visible, 1024)))
+
+
 def _packed_fwd_eligible(q, k, v, has_group_ids):
     """Gate for the pack-GQA + TMA forward kernel (Hopper production path).
 
@@ -946,11 +1173,23 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
     if slide_size > 0 and slide_size >= N_KV:
         slide_size = 0
 
+    no_overrides = (BLOCK_Q is None and BLOCK_KV is None
+                    and num_warps is None and num_stages is None)
+
+    # Batched KV-cache decode: split-KV (flash-decoding). The single-pass
+    # kernels launch only B*H_KV programs at q_len~1, starving the SMs on
+    # a DRAM-bound workload; split-KV partitions the KV range and merges
+    # partial softmaxes (exact — same online-softmax algebra).
+    if no_overrides and H_Q % H_KV == 0:
+        ns = _decode_splitkv_splits(B, H_KV, N_KV, N, H_Q // H_KV, causal,
+                                    slide_size, group_ids is not None)
+        if ns > 1:
+            return _launch_decode_splitkv(q, k, v, output, slide_size, ns)
+
     # Hopper production path: pack-GQA + TMA + 3-phase kernel. Explicit
     # block/warp/stage overrides keep the classic kernel (the sweep
     # scripts tune that kernel's config space).
-    if (BLOCK_Q is None and BLOCK_KV is None and num_warps is None
-            and num_stages is None
+    if (no_overrides
             and _packed_fwd_eligible(q, k, v, group_ids is not None)):
         return _launch_packed_fwd(q, k, v, output, causal, slide_size, kv_offset)
 

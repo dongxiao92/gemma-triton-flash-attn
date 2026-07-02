@@ -49,6 +49,12 @@
 - `context/baseline.md`: 全部量化数据及复现命令
 
 **最近结论**：
+- **[2026-07-01] 五大工业 workload SOL 调优（第三轮）**：详见 `docs/workloads_sol.md`
+  - Workloads: W1 packed SFT / W2 32K RAG prefill / W3 B=8 chat prefill / W4 B=32 decode / W5 MoE-26B-A4B 训练
+  - **新增 split-KV decode (flash-decoding)**：decode 单遍 kernel 只有 B×H_KV=32 programs → DRAM-bound workload 23% SOL；split-KV 分块部分 softmax + combine kernel 精确合并 → **86.5% DRAM SOL**，global decode op 3.5×，W4 每 token attention 6.22→2.89ms
+  - Gate：causal suffix、q_len×R≤32、visible KV≥2048、B×H_KV<264；sliding decode (kv=512) split 反而慢（launch 开销）→ 保持 classic，属 launch-bound（49μs vs roofline 5μs）
+  - dQ TMA re-sweep：默认仍最优；dQ 已在 L1TEX bound 79-81%（W5 80.7%）
+  - fwd/dKV 60-68% 仍是 occupancy 天花板；全部正确性套件（17 decode cases 含 B=32/B=8×32K、varlen、functional、e2e、parity）PASS
 - **[2026-07-01] Varlen / multi-sample packing 支持落地**：
   - 之前 adapter 静默丢弃 transformers 的 FlashAttentionKwargs（cu_seq_lens_q/k）→ packing 输入会跨文档 attention
   - 三个生产 kernel 加 `HAS_VARLEN` constexpr（program_id(1) = (seq, head)，mask 全部 per-seq local 坐标，指针/descriptor 移 seq_start，越界 block 早退）
@@ -385,6 +391,8 @@ softcap/ALiBi/paged KV/varlen、PyPI 发布/CI/多平台支持。
 | 2026-07-01 | **Triton 3.5 sm_90 的 occupancy 硬顶**：fp32 acc (BQ×512) + 192KB smem → 1 CTA/SM、2 warps/scheduler、issue 0.45/cyc。FA3 式 warp-spec/pingpong 不可表达，fwd/dKV D=512 SOL 停在 60-68% | NCU + 实验矩阵 |
 | 2026-07-01 | **triton `//` 对负数是 trunc（C 语义）不是 floor**：3-phase loop 边界公式必须保持除数非负，否则 SWA unmasked 区间越界（曾致 cos 0.78） | debug 实录 |
 | 2026-07-01 | **greedy generation 的 token 不匹配 ≠ kernel bug**：near-tie（top-2 margin ≲ bf16 噪声）翻转后链式发散。判定标准用 teacher-forced stepwise logit parity | decode parity 实测 |
+| 2026-07-01 | **batched decode 用 split-KV 而非单遍 kernel**：B×H_KV programs 喂不饱 132 SM（DRAM-bound 23% SOL）；split-KV 到 ~264 programs → 86.5% DRAM SOL、3.5×。但 kv≤512 时两次 launch 开销反超收益（75μs vs 49μs）→ gate visible≥2048 | workloads_sol |
+| 2026-07-01 | **dQ 在 TMA 下 config space 依旧默认最优**（13 configs swept）；dQ 的 L1TEX bound 79-81% 即其天花板 | hopper_dq_tma_sweep |
 
 ---
 

@@ -58,13 +58,30 @@ def main():
         (8, 1, 64, 1024, 256, True, 512), # chunked prefill continuation, SWA
         (8, 1, 7, 7, 512, True, 0),       # tiny equal-length (N < 16)
         (8, 1, 1, 1, 512, True, 0),       # first decode step, empty past
+        # batched decode (split-KV / flash-decoding path)
+        (8, 1, 1, 8192, 512, True, 0),    # long cache, B=1 -> many splits
+        (8, 1, 1, 8192, 256, True, 512),  # SWA long cache (window bound)
+        (8, 1, 4, 4096, 512, True, 0),    # speculative chunk (q_len=4)
+        (8, 1, 2, 3000, 256, True, 512),  # odd cache length + SWA
+    ]
+    cases += [
+        # (H_Q, H_KV, B, q, kv, D, slide) with explicit batch
+        ("B32", 8, 1, 32, 1, 8192, 512, 0),
+        ("B32", 8, 1, 32, 1, 8192, 256, 512),
+        ("B8", 8, 1, 8, 1, 32768, 512, 0),
     ]
     n_fail = 0
-    for (H_Q, H_KV, Nq, Nkv, D, causal, slide) in cases:
-        q = torch.randn(1, H_Q, Nq, D, dtype=dtype, device="cuda")
-        k = torch.randn(1, H_KV, Nkv, D, dtype=dtype, device="cuda")
-        v = torch.randn(1, H_KV, Nkv, D, dtype=dtype, device="cuda")
-        tag = f"q={Nq:>4} kv={Nkv:>4} D={D} slide={slide}"
+    for case in cases:
+        if case[0] == "B32" or case[0] == "B8":
+            _, H_Q, H_KV, B, Nq, Nkv, D, slide = case
+            causal = True
+        else:
+            (H_Q, H_KV, Nq, Nkv, D, causal, slide) = case
+            B = 1
+        q = torch.randn(B, H_Q, Nq, D, dtype=dtype, device="cuda")
+        k = torch.randn(B, H_KV, Nkv, D, dtype=dtype, device="cuda")
+        v = torch.randn(B, H_KV, Nkv, D, dtype=dtype, device="cuda")
+        tag = f"B={B:>2} q={Nq:>4} kv={Nkv:>5} D={D} slide={slide}"
         try:
             out = attention_flash_gqa(q, k, v, causal=causal, slide_size=slide)
             with torch.no_grad():

@@ -27,7 +27,15 @@ slide = 512 if "swa" in which else 0
 torch.manual_seed(0)
 dt = torch.float16
 
-if which.startswith("v"):
+if which.startswith("dec"):
+    # decode: B sessions, q=1, KV cache of N tokens (e.g. dec512 8192 32)
+    B = int(sys.argv[3]) if len(sys.argv) > 3 else 32
+    q = torch.randn(B, 8, 1, D, dtype=dt, device="cuda")
+    k = torch.randn(B, 1, N, D, dtype=dt, device="cuda")
+    v = torch.randn(B, 1, N, D, dtype=dt, device="cuda")
+    for _ in range(3):
+        attention_flash_gqa(q, k, v, causal=True, slide_size=slide)
+elif which.startswith("v"):
     from flash_attn.attention import flash_attn_gqa_varlen_train
     n_seqs = int(sys.argv[3]) if len(sys.argv) > 3 else 4
     T = n_seqs * N
