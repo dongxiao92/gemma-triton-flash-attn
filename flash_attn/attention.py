@@ -1081,12 +1081,18 @@ def _flash_attn_gqa_bwd_dq_kernel(
     GroupHi_ptr,
     stride_gb, stride_gn,
     HAS_GROUP_IDS: tl.constexpr,
+    # TMA path (Hopper): K/V streamed via tensor descriptors over the
+    # (B*H_KV*SEQ_LEN, D) flattening. Trailing defaults keep old callers.
+    K_desc=None,
+    V_desc=None,
+    USE_TMA: tl.constexpr = False,
 ):
     q_block_idx = tl.program_id(0)
     bh_idx = tl.program_id(1)
     q_h_idx = bh_idx % N_Q_HEADS
     b_idx = bh_idx // N_Q_HEADS
     kv_h_idx = q_h_idx * N_KV_HEADS // N_Q_HEADS
+    kv_row0 = (b_idx * N_KV_HEADS + kv_h_idx) * SEQ_LEN
 
     q_base = Q_ptr + b_idx * stride_qb + q_h_idx * stride_qh
     k_base = K_ptr + b_idx * stride_kb + kv_h_idx * stride_kh
@@ -1157,10 +1163,14 @@ def _flash_attn_gqa_bwd_dq_kernel(
         kv_offsets = kv_start + tl.arange(0, BLOCK_KV)
         kv_mask = kv_offsets < SEQ_LEN
 
-        k_ptrs = k_base + kv_offsets[:, None] * stride_kn + d_range[None, :] * stride_kd
-        k_block = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
-        v_ptrs = v_base + kv_offsets[:, None] * stride_vn + d_range[None, :] * stride_vd
-        v_block = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
+        if USE_TMA:
+            k_block = K_desc.load([kv_row0 + kv_start, 0])
+            v_block = V_desc.load([kv_row0 + kv_start, 0])
+        else:
+            k_ptrs = k_base + kv_offsets[:, None] * stride_kn + d_range[None, :] * stride_kd
+            k_block = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0)
+            v_ptrs = v_base + kv_offsets[:, None] * stride_vn + d_range[None, :] * stride_vd
+            v_block = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
 
         scores = tl.dot(q_block, tl.trans(k_block)).to(tl.float32) * scale_log2e
         if IS_CAUSAL:
@@ -1501,6 +1511,11 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
     GroupHi_ptr,
     stride_gb, stride_gn,
     HAS_GROUP_IDS: tl.constexpr,
+    # TMA path (Hopper): Q/dO streamed via tensor descriptors over the
+    # (B*H_Q*SEQ_LEN, D) flattening. Trailing defaults keep old callers.
+    Q_desc=None,
+    DO_desc=None,
+    USE_TMA: tl.constexpr = False,
 ):
     # Grid: (cdiv(SEQ_LEN, BLOCK_KV), B * N_KV_HEADS, Q_SPLITS)
     kv_block_idx = tl.program_id(0)
@@ -1582,6 +1597,7 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
     # into the SAME dk_acc/dv_acc — this replaces the expand+reduce pattern.
     for qh_offset in tl.static_range(GQA_RATIO):
         q_h_idx = kv_h_idx * GQA_RATIO + qh_offset
+        qh_row0 = (b_idx * N_Q_HEADS + q_h_idx) * SEQ_LEN
         q_base = Q_ptr + b_idx * stride_qb + q_h_idx * stride_qh
         do_base = dO_ptr + b_idx * stride_dob + q_h_idx * stride_doh
         lse_base = LSE_ptr + b_idx * stride_lseb + q_h_idx * stride_lseh
@@ -1592,10 +1608,14 @@ def _flash_attn_gqa_bwd_dkv_packed_kernel(
             q_offsets = q_start_pos + tl.arange(0, BLOCK_Q)
             q_mask_local = q_offsets < SEQ_LEN
 
-            q_ptrs = q_base + q_offsets[:, None] * stride_qn + d_range[None, :] * stride_qd
-            q_block = tl.load(q_ptrs, mask=q_mask_local[:, None], other=0.0)
-            do_ptrs = do_base + q_offsets[:, None] * stride_don + d_range[None, :] * stride_dod
-            do_block = tl.load(do_ptrs, mask=q_mask_local[:, None], other=0.0)
+            if USE_TMA:
+                q_block = Q_desc.load([qh_row0 + q_start_pos, 0])
+                do_block = DO_desc.load([qh_row0 + q_start_pos, 0])
+            else:
+                q_ptrs = q_base + q_offsets[:, None] * stride_qn + d_range[None, :] * stride_qd
+                q_block = tl.load(q_ptrs, mask=q_mask_local[:, None], other=0.0)
+                do_ptrs = do_base + q_offsets[:, None] * stride_don + d_range[None, :] * stride_dod
+                do_block = tl.load(do_ptrs, mask=q_mask_local[:, None], other=0.0)
             lse = tl.load(lse_base + q_offsets * stride_lsen, mask=q_mask_local, other=0.0)
             delta = tl.load(delta_base + q_offsets * stride_dn, mask=q_mask_local, other=0.0)
             lse_log2 = lse * LOG2E
@@ -1954,6 +1974,19 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         GQA_RATIO = H_Q // H_KV
         # dk, dv allocated after dKV kernel (expanded buffer + reduce)
 
+        # TMA descriptors for the streamed operands (Hopper): K/V for the dQ
+        # kernel, Q/dO for the dKV kernel. Same size gate as the forward —
+        # ~20us host-side launch cost regresses small SWA kernels.
+        use_tma_bwd = (
+            not _TENSOR_DESC_UNAVAILABLE
+            and (D >= 512 or N >= 8192)
+            and torch.cuda.get_device_capability(q.device)[0] >= 9
+            and q.dtype in (torch.float16, torch.bfloat16)
+            and D in (64, 128, 256, 512)
+            and all(t.is_contiguous() and t.data_ptr() % 16 == 0
+                    for t in (q, k, v, do))
+        )
+
         # --- dQ kernel ---
         # D-specific tuning (sweeps in context/baseline.md):
         #   D=512: (BQ=32, BKV=64, w=8)  — register-constrained, need 8 warps
@@ -1965,6 +1998,14 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         BLOCK_Q_BW = max(16, min(BLOCK_Q_BW, triton.next_power_of_2(N)))
         BLOCK_KV_BW = max(16, min(BLOCK_KV_BW, triton.next_power_of_2(N)))
         grid_dq = (triton.cdiv(N, BLOCK_Q_BW), B * H_Q)
+
+        if use_tma_bwd:
+            kd_dq = TensorDescriptor.from_tensor(
+                k.reshape(B * H_KV * N, D), block_shape=[BLOCK_KV_BW, D])
+            vd_dq = TensorDescriptor.from_tensor(
+                v.reshape(B * H_KV * N, D), block_shape=[BLOCK_KV_BW, D])
+        else:
+            kd_dq = vd_dq = None
 
         _flash_attn_gqa_bwd_dq_kernel[grid_dq](
             q, k, v, do, o, dq, lse, delta,
@@ -1985,6 +2026,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
             stride_gb=g_strides_dq[0], stride_gn=g_strides_dq[1],
             HAS_GROUP_IDS=has_group_ids,
+            K_desc=kd_dq, V_desc=vd_dq, USE_TMA=use_tma_bwd,
             num_warps=num_warps_bw, num_stages=2,
         )
 
@@ -2000,11 +2042,26 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         # The old split path (_flash_attn_gqa_bwd_dkv_kernel with expand+reduce)
         # is kept in the source for reference but no longer on the hot path.
         if D >= 512:
-            # Pack-GQA sweep @ N=4K Gemma4 (H_Q=32,H_KV=4): (BKV=16,BQ=64,w=4)
-            # wins 9.36ms vs old (32,16,8)=13.13ms (-29%); BKV=16 halves
-            # dk_acc/dv_acc shmem (32KB×2 vs 64KB×2), freeing budget for BQ=64
-            # which cuts the inner Q loop 4× and reuses each Q/dO tile better.
-            BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 16, 64, 4
+            if use_tma_bwd:
+                # TMA re-sweep on H100 (hopper port, N=8K E2B): TMA frees the
+                # address registers that made BKV=32 spill catastrophically
+                # (20.5ms pointer-loads -> 6.5ms TMA); beats the BKV=16
+                # pointer-load default (8.4ms) by 28%.
+                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 64, 8
+                num_stages_dkv = 2
+            else:
+                # Pack-GQA sweep @ N=4K Gemma4 (H_Q=32,H_KV=4): (BKV=16,BQ=64,w=4)
+                # wins 9.36ms vs old (32,16,8)=13.13ms (-29%); BKV=16 halves
+                # dk_acc/dv_acc shmem (32KB×2 vs 64KB×2), freeing budget for BQ=64
+                # which cuts the inner Q loop 4× and reuses each Q/dO tile better.
+                BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 16, 64, 4
+                num_stages_dkv = 2
+        elif use_tma_bwd:
+            # TMA re-sweep on H100 (hopper port): small resident KV tile +
+            # streamed Q/dO via TMA beats the big-tile config (0.247 vs
+            # 0.288ms @ E2B SWA N=8K). use_tma_bwd implies N >= 8192 here,
+            # so the short-N grid-starvation regime never reaches this arm.
+            BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 64, 4
             num_stages_dkv = 2
         else:
             # D<512: (BKV=64, BQ=128, w=8, s=1) is the big-tile config that
@@ -2065,6 +2122,14 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             dk = torch.empty_like(k)
             dv = torch.empty_like(v)
 
+        if use_tma_bwd:
+            qd_dkv = TensorDescriptor.from_tensor(
+                q.reshape(B * H_Q * N, D), block_shape=[BLOCK_Q_DKV, D])
+            dod_dkv = TensorDescriptor.from_tensor(
+                do.reshape(B * H_Q * N, D), block_shape=[BLOCK_Q_DKV, D])
+        else:
+            qd_dkv = dod_dkv = None
+
         _flash_attn_gqa_bwd_dkv_packed_kernel[grid_dkv](
             q, k, v, do, dk, dv, lse, delta,
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
@@ -2085,6 +2150,7 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
             stride_gb=g_strides_dq[0], stride_gn=g_strides_dq[1],
             HAS_GROUP_IDS=has_group_ids,
+            Q_desc=qd_dkv, DO_desc=dod_dkv, USE_TMA=use_tma_bwd,
             num_warps=num_warps_dkv, num_stages=num_stages_dkv,
         )
 
