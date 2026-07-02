@@ -41,6 +41,8 @@ Branch `hopper-port` ports and re-tunes the kernels for H100/sm_90
   Overhead vs the native API: +1.7% (D=512 fwd+bwd), +8% (D=256 SWA) — the
   irreducible FA-to-native layout copies. Unsupported FA features raise
   loudly (dropout, softcap, ALiBi, paged KV) instead of silently degrading.
+  Runnable walkthrough (dense / SWA / training / packing / KV-cache decode /
+  import shim): [`examples/fa_compat_example.py`](examples/fa_compat_example.py).
 
 Full report: [`docs/hopper_port.md`](docs/hopper_port.md).
 
