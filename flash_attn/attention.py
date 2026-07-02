@@ -1,6 +1,13 @@
 import torch
 import triton
 import triton.language as tl
+
+try:
+    from triton.tools.tensor_descriptor import TensorDescriptor
+    _TENSOR_DESC_UNAVAILABLE = False
+except ImportError:  # older triton: packed TMA fwd disabled, classic path used
+    TensorDescriptor = None
+    _TENSOR_DESC_UNAVAILABLE = True
 import math
 
 
@@ -446,6 +453,275 @@ def _flash_attn_gqa_kernel(
 
 
 # =====================================================================
+# Pack-GQA + TMA forward — the Hopper (sm_90) production forward kernel.
+# (Hopper port optimization, 2026-07.)
+#
+# Three changes vs the classic kernel above, all driven by H100 NCU data
+# (classic fwd @ E2B D=512: SM 34%, Memory 45%, DRAM 2% — latency-bound
+# at 1 CTA/SM with K/V re-streamed per Q-head program):
+#
+# 1. Pack-GQA: rows of the Q tile map to (q_pos, q_head) pairs:
+#        row r -> q_pos = block * QPOS + r // GQA_RATIO
+#                 head  = kv_h * GQA_RATIO + r % GQA_RATIO
+#    with QPOS = BLOCK_Q // GQA_RATIO. One tl.dot serves the whole GQA
+#    group, so K/V L1 traffic drops by GQA_RATIO x. Unlike the failed
+#    _flash_attn_gqa_grouped_kernel (one accumulator per head -> spill),
+#    there is still exactly ONE accumulator and ONE score matrix.
+#    Grid: (cdiv(SEQ_LEN, QPOS), B * N_KV_HEADS) — same program count and
+#    per-program tensor work as the classic kernel.
+#
+# 2. TMA: K/V arrive via tensor descriptors (host-side TensorDescriptor
+#    over the (B*H_KV*N_KV, D) flattening) — hardware bulk copies replace
+#    per-element cp.async address generation. +13% on D=512 @ N=8K.
+#
+# 3. Three-phase KV loop: masked left edge (SWA) / unmasked middle /
+#    masked diagonal. The classic kernel only split plain-causal loops;
+#    SWA paid window-mask + NaN-clamp on every tile. NOTE: Triton's //
+#    truncates toward zero (C semantics), so every phase-bound division
+#    keeps its operands non-negative.
+#
+# Supports KV_OFFSET (decode / suffix cross-length, see classic kernel)
+# and STORE_LSE (training forward). Image-group OR-mask is NOT
+# implemented here — the multimodal training path uses the classic
+# kernel. Requires N_Q_HEADS == GQA_RATIO * N_KV_HEADS and contiguous
+# K/V (descriptor flattening); the wrappers gate on this.
+# =====================================================================
+
+@triton.jit
+def _flash_attn_gqa_fwd_packed_kernel(
+    Q_ptr, K_desc, V_desc, O_ptr,
+    stride_qb, stride_qh, stride_qn, stride_qd,
+    stride_ob, stride_oh, stride_on, stride_od,
+    N_KV_HEADS,
+    SEQ_LEN,
+    HEAD_DIM: tl.constexpr,
+    scale,
+    BLOCK_Q: tl.constexpr,      # tile rows = QPOS * GQA_RATIO
+    BLOCK_KV: tl.constexpr,
+    GQA_RATIO: tl.constexpr,
+    IS_CAUSAL: tl.constexpr,
+    SLIDE_SIZE: tl.constexpr,
+    LSE_ptr,
+    stride_lseb, stride_lseh, stride_lsen,
+    STORE_LSE: tl.constexpr,
+    KV_OFFSET=0,
+    WARP_SPECIALIZE: tl.constexpr = False,
+):
+    QPOS: tl.constexpr = BLOCK_Q // GQA_RATIO
+    q_block_idx = tl.program_id(0)
+    bkvh_idx = tl.program_id(1)
+    kv_h_idx = bkvh_idx % N_KV_HEADS
+    b_idx = bkvh_idx // N_KV_HEADS
+
+    row = tl.arange(0, BLOCK_Q)
+    q_pos = q_block_idx * QPOS + row // GQA_RATIO
+    q_head = kv_h_idx * GQA_RATIO + row % GQA_RATIO
+    q_mask = q_pos < SEQ_LEN
+    d_range = tl.arange(0, HEAD_DIM)
+
+    q_row_base = Q_ptr + b_idx * stride_qb + q_head * stride_qh + q_pos * stride_qn
+    o_row_base = O_ptr + b_idx * stride_ob + q_head * stride_oh + q_pos * stride_on
+
+    KV_SEQ_LEN = SEQ_LEN + KV_OFFSET
+    # Row offset of this (batch, kv_head) in the flattened (B*H_KV*N_KV, D)
+    # descriptor view.
+    kv_row0 = bkvh_idx * KV_SEQ_LEN
+
+    # All KV coordinates below are absolute positions in the KV stream;
+    # q row i attends around position i + KV_OFFSET.
+    q_lo = q_block_idx * QPOS + KV_OFFSET       # first q abs position
+    q_hi = q_lo + QPOS - 1                      # last q abs position
+
+    if IS_CAUSAL:
+        kv_end = q_lo + QPOS
+    else:
+        kv_end = KV_SEQ_LEN
+
+    if IS_CAUSAL and SLIDE_SIZE > 0:
+        kv_min = tl.maximum(0, q_lo - SLIDE_SIZE + 1)
+        kv_loop_start = (kv_min // BLOCK_KV) * BLOCK_KV
+    else:
+        kv_loop_start = 0
+
+    # Unmasked middle phase [mid_start, mid_end): tiles where every row of
+    # the block attends every key — kv in [q_hi - SLIDE + 1, q_lo] (SWA)
+    # or kv <= q_lo (plain causal), rounded inward to whole tiles.
+    if IS_CAUSAL:
+        if SLIDE_SIZE > 0:
+            ms = tl.maximum(q_hi - SLIDE_SIZE + 1, 0)
+            mid_start = tl.maximum(((ms + BLOCK_KV - 1) // BLOCK_KV) * BLOCK_KV,
+                                   kv_loop_start)
+        else:
+            mid_start = kv_loop_start
+        mid_end = ((q_lo + 1) // BLOCK_KV) * BLOCK_KV
+        mid_end = tl.maximum(mid_end, mid_start)
+    else:
+        mid_start = kv_loop_start
+        mid_end = kv_loop_start  # non-causal: single masked loop (seq boundary)
+
+    LOG2E: tl.constexpr = 1.4426950408889634
+    scale_log2e = scale * LOG2E
+
+    m_i = tl.full([BLOCK_Q], value=-float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_Q], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_Q, HEAD_DIM], dtype=tl.float32)
+
+    q_ptrs = q_row_base[:, None] + d_range[None, :] * stride_qd
+    q_chunk = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
+
+    # Phase A: masked left edge (SWA only; empty for plain causal).
+    for kv_start in tl.range(kv_loop_start, mid_start, BLOCK_KV,
+                             warp_specialize=WARP_SPECIALIZE):
+        kv_offsets = kv_start + tl.arange(0, BLOCK_KV)
+        kv_mask = kv_offsets < KV_SEQ_LEN
+        k_chunk = K_desc.load([kv_row0 + kv_start, 0])
+        scores = tl.dot(q_chunk, tl.trans(k_chunk)) * scale_log2e
+        valid = (kv_offsets[None, :] <= q_pos[:, None] + KV_OFFSET) & kv_mask[None, :]
+        if SLIDE_SIZE > 0:
+            valid &= (q_pos[:, None] + KV_OFFSET - kv_offsets[None, :] < SLIDE_SIZE)
+        scores = tl.where(valid, scores, -float("inf"))
+        block_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(m_i, block_max)
+        # Left-edge tiles can be fully masked for some rows -> NaN clamp.
+        safe_new = tl.maximum(new_max, -1e20)
+        alpha = tl.math.exp2(tl.maximum(m_i, -1e20) - safe_new)
+        p = tl.math.exp2(scores - safe_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+        v_block = V_desc.load([kv_row0 + kv_start, 0])
+        acc += tl.dot(p.to(v_block.dtype), v_block)
+        m_i = new_max
+
+    # Phase B: unmasked middle — no mask op, no seq-boundary check
+    # (kv <= q_lo < KV_SEQ_LEN by construction).
+    for kv_start in tl.range(mid_start, mid_end, BLOCK_KV,
+                             warp_specialize=WARP_SPECIALIZE):
+        k_chunk = K_desc.load([kv_row0 + kv_start, 0])
+        scores = tl.dot(q_chunk, tl.trans(k_chunk)) * scale_log2e
+        block_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(m_i, block_max)
+        alpha = tl.math.exp2(m_i - new_max)
+        p = tl.math.exp2(scores - new_max[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+        v_block = V_desc.load([kv_row0 + kv_start, 0])
+        acc += tl.dot(p.to(v_block.dtype), v_block)
+        m_i = new_max
+
+    # Phase C: masked diagonal (+ seq boundary for non-causal).
+    for kv_start in tl.range(mid_end, kv_end, BLOCK_KV,
+                             warp_specialize=WARP_SPECIALIZE):
+        kv_offsets = kv_start + tl.arange(0, BLOCK_KV)
+        kv_mask = kv_offsets < KV_SEQ_LEN
+        k_chunk = K_desc.load([kv_row0 + kv_start, 0])
+        scores = tl.dot(q_chunk, tl.trans(k_chunk)) * scale_log2e
+        if IS_CAUSAL:
+            valid = (kv_offsets[None, :] <= q_pos[:, None] + KV_OFFSET) & kv_mask[None, :]
+            if SLIDE_SIZE > 0:
+                valid &= (q_pos[:, None] + KV_OFFSET - kv_offsets[None, :] < SLIDE_SIZE)
+        else:
+            valid = kv_mask[None, :]
+        scores = tl.where(valid, scores, -float("inf"))
+        block_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(m_i, block_max)
+        if SLIDE_SIZE > 0:
+            safe_new = tl.maximum(new_max, -1e20)
+            alpha = tl.math.exp2(tl.maximum(m_i, -1e20) - safe_new)
+            p = tl.math.exp2(scores - safe_new[:, None])
+        else:
+            alpha = tl.math.exp2(m_i - new_max)
+            p = tl.math.exp2(scores - new_max[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None]
+        v_block = V_desc.load([kv_row0 + kv_start, 0])
+        acc += tl.dot(p.to(v_block.dtype), v_block)
+        m_i = new_max
+
+    acc = acc / l_i[:, None]
+
+    o_ptrs = o_row_base[:, None] + d_range[None, :] * stride_od
+    tl.store(o_ptrs, acc, mask=q_mask[:, None])
+
+    if STORE_LSE:
+        LN2: tl.constexpr = 0.6931471805599453
+        lse = m_i * LN2 + tl.log(l_i)
+        lse_ptrs = (LSE_ptr + b_idx * stride_lseb + q_head * stride_lseh
+                    + q_pos * stride_lsen)
+        tl.store(lse_ptrs, lse, mask=q_mask)
+
+
+def _packed_fwd_eligible(q, k, v, has_group_ids):
+    """Gate for the pack-GQA + TMA forward kernel (Hopper production path).
+
+    Size gate: the TMA launch path costs ~20-25us on the host per call
+    (tensormap conversion), which regresses small sliding-window kernels.
+    D>=512 kernels are always heavy enough; D<512 requires a long KV
+    stream (measured crossover between N=4K and 8K on H100).
+    """
+    if _TENSOR_DESC_UNAVAILABLE or has_group_ids:
+        return False
+    B, H_Q, N, D = q.shape
+    _, H_KV, N_KV, _ = k.shape
+    ratio = H_Q // H_KV
+    return (
+        (D >= 512 or N_KV >= 8192)
+        and torch.cuda.get_device_capability(q.device)[0] >= 9
+        and H_Q == ratio * H_KV
+        and ratio in (1, 2, 4, 8, 16)
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and k.is_contiguous() and v.is_contiguous()
+        and k.data_ptr() % 16 == 0 and v.data_ptr() % 16 == 0
+        and D in (64, 128, 256, 512)
+    )
+
+
+def _launch_packed_fwd(q, k, v, output, causal, slide_size, kv_offset,
+                       lse=None, BLOCK_Q=None, BLOCK_KV=None,
+                       num_warps=None, num_stages=None, warp_specialize=False):
+    """Launch the pack-GQA + TMA forward kernel. Caller checked eligibility."""
+    B, H_Q, N, D = q.shape
+    _, H_KV, N_KV, _ = k.shape
+    ratio = H_Q // H_KV
+    if BLOCK_Q is None:
+        BLOCK_Q = 64 if D >= 512 else 128
+    if BLOCK_KV is None:
+        BLOCK_KV = 32 if D >= 512 else 64
+    if num_warps is None:
+        num_warps = 8 if D >= 256 else 4
+    if num_stages is None:
+        num_stages = 2
+    BLOCK_Q = max(BLOCK_Q, ratio)  # need at least one q position per tile
+    BLOCK_KV = max(16, min(BLOCK_KV, triton.next_power_of_2(N_KV)))
+    qpos = BLOCK_Q // ratio
+
+    k_desc = TensorDescriptor.from_tensor(
+        k.reshape(B * H_KV * N_KV, D), block_shape=[BLOCK_KV, D])
+    v_desc = TensorDescriptor.from_tensor(
+        v.reshape(B * H_KV * N_KV, D), block_shape=[BLOCK_KV, D])
+
+    store_lse = lse is not None
+    grid = (triton.cdiv(N, qpos), B * H_KV)
+    _flash_attn_gqa_fwd_packed_kernel[grid](
+        q, k_desc, v_desc, output,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+        N_KV_HEADS=H_KV, SEQ_LEN=N, HEAD_DIM=D,
+        scale=1.0 / math.sqrt(D),
+        BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV, GQA_RATIO=ratio,
+        IS_CAUSAL=causal, SLIDE_SIZE=slide_size,
+        LSE_ptr=lse,
+        stride_lseb=lse.stride(0) if store_lse else 0,
+        stride_lseh=lse.stride(1) if store_lse else 0,
+        stride_lsen=lse.stride(2) if store_lse else 0,
+        STORE_LSE=store_lse,
+        KV_OFFSET=kv_offset,
+        WARP_SPECIALIZE=warp_specialize,
+        num_warps=num_warps, num_stages=num_stages,
+    )
+    return output
+
+
+# =====================================================================
 # Grouped Flash Attention GQA — multi-head fusion for K/V reuse
 #
 # Motivation: Gemma-4-E2B has GQA 8:1 (H_Q=8, H_KV=1). Every 8 Q heads read
@@ -629,6 +905,14 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
     # full causal. Take the full-causal path (skips window mask + NaN clamp).
     if slide_size > 0 and slide_size >= N_KV:
         slide_size = 0
+
+    # Hopper production path: pack-GQA + TMA + 3-phase kernel. Explicit
+    # block/warp/stage overrides keep the classic kernel (the sweep
+    # scripts tune that kernel's config space).
+    if (BLOCK_Q is None and BLOCK_KV is None and num_warps is None
+            and num_stages is None
+            and _packed_fwd_eligible(q, k, v, group_ids is not None)):
+        return _launch_packed_fwd(q, k, v, output, causal, slide_size, kv_offset)
 
     # Tuned defaults (sweeps in context/baseline.md). Block sizes scale inversely
     # with HEAD_DIM to keep shared memory usage ~constant at ~128KB.
@@ -1593,6 +1877,18 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         if slide_size > 0 and slide_size >= N:
             slide_size = 0
 
+        has_group_ids = group_ids is not None
+
+        # Hopper production path (see _flash_attn_gqa_fwd_packed_kernel).
+        if _packed_fwd_eligible(q, k, v, has_group_ids):
+            _launch_packed_fwd(q, k, v, output, causal, slide_size, 0, lse=lse)
+            ctx.save_for_backward(q, k, v, output, lse,
+                                  group_ids, group_lo, group_hi_excl)
+            ctx.causal = causal
+            ctx.slide_size = slide_size
+            ctx.has_group_ids = has_group_ids
+            return output
+
         BLOCK_Q = 64 if D >= 512 else 128
         BLOCK_KV = 32 if D >= 512 else 64
         BLOCK_D = D
@@ -1603,7 +1899,6 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         BLOCK_KV = max(16, min(BLOCK_KV, triton.next_power_of_2(N)))
         grid = (triton.cdiv(N, BLOCK_Q), B * H_Q)
 
-        has_group_ids = group_ids is not None
         if has_group_ids:
             assert group_lo is not None and group_hi_excl is not None
             g_strides = (group_ids.stride(0), group_ids.stride(1))
