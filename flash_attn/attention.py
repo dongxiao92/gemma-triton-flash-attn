@@ -273,6 +273,12 @@ def _flash_attn_gqa_kernel(
     GroupHi_ptr,
     stride_gb, stride_gn,
     HAS_GROUP_IDS: tl.constexpr,
+    # KV-cache / cross-length support (Hopper port): when the KV sequence is
+    # longer than the Q sequence (decode / prefill continuation), queries are
+    # the SUFFIX of the KV stream: q row i has absolute position i + KV_OFFSET
+    # where KV_OFFSET = kv_len - q_len. Default 0 keeps the original
+    # equal-length semantics for all existing callers.
+    KV_OFFSET=0,
 ):
     # Grid: (cdiv(SEQ_LEN, BLOCK_Q), B * N_Q_HEADS)
     q_block_idx = tl.program_id(0)
@@ -309,14 +315,16 @@ def _flash_attn_gqa_kernel(
         block_img_lo = tl.min(q_group_lo, axis=0)
         block_img_hi = tl.max(q_group_hi, axis=0)
 
-    # Determine KV iteration range.
+    # Determine KV iteration range. All KV bounds live in KV coordinates:
+    # q row i attends around absolute position i + KV_OFFSET.
+    KV_SEQ_LEN = SEQ_LEN + KV_OFFSET
     if IS_CAUSAL:
-        kv_end = (q_block_idx + 1) * BLOCK_Q
+        kv_end = (q_block_idx + 1) * BLOCK_Q + KV_OFFSET
     else:
-        kv_end = SEQ_LEN
+        kv_end = KV_SEQ_LEN
 
     if IS_CAUSAL and SLIDE_SIZE > 0:
-        kv_min = tl.maximum(0, q_block_idx * BLOCK_Q - SLIDE_SIZE + 1)
+        kv_min = tl.maximum(0, q_block_idx * BLOCK_Q + KV_OFFSET - SLIDE_SIZE + 1)
         kv_loop_start = (kv_min // BLOCK_KV) * BLOCK_KV
     else:
         kv_loop_start = 0
@@ -344,7 +352,7 @@ def _flash_attn_gqa_kernel(
     # phase optimization is unsafe — disable it.
     USE_SPLIT: tl.constexpr = (HEAD_DIM < 512)
     if IS_CAUSAL and SLIDE_SIZE == 0 and USE_SPLIT and not HAS_GROUP_IDS:
-        kv_end_unmasked = (q_block_idx * BLOCK_Q) // BLOCK_KV * BLOCK_KV
+        kv_end_unmasked = (q_block_idx * BLOCK_Q + KV_OFFSET) // BLOCK_KV * BLOCK_KV
     else:
         kv_end_unmasked = kv_loop_start  # skip unmasked phase
 
@@ -374,7 +382,7 @@ def _flash_attn_gqa_kernel(
     # Phase 2: masked KV iterations (diagonal + seq boundary + SWA).
     for kv_start in range(kv_end_unmasked, kv_end, BLOCK_KV):
         kv_offsets = kv_start + tl.arange(0, BLOCK_KV)
-        kv_mask = kv_offsets < SEQ_LEN
+        kv_mask = kv_offsets < KV_SEQ_LEN
 
         q_ptrs = q_base + q_offsets[:, None] * stride_qn + d_range[None, :] * stride_qd
         q_chunk = tl.load(q_ptrs, mask=q_mask[:, None], other=0.0)
@@ -384,11 +392,11 @@ def _flash_attn_gqa_kernel(
 
         if IS_CAUSAL:
             if SLIDE_SIZE > 0:
-                valid = (kv_offsets[None, :] <= q_offsets[:, None]) & \
-                        (q_offsets[:, None] - kv_offsets[None, :] < SLIDE_SIZE) & \
+                valid = (kv_offsets[None, :] <= q_offsets[:, None] + KV_OFFSET) & \
+                        (q_offsets[:, None] + KV_OFFSET - kv_offsets[None, :] < SLIDE_SIZE) & \
                         kv_mask[None, :]
             else:
-                valid = (kv_offsets[None, :] <= q_offsets[:, None]) & kv_mask[None, :]
+                valid = (kv_offsets[None, :] <= q_offsets[:, None] + KV_OFFSET) & kv_mask[None, :]
         else:
             valid = kv_mask[None, :]
         # Image-bidirectional OR-mask: queries within a vision span see all
@@ -606,12 +614,20 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
                 spans beyond the SWA window.
     """
     B, H_Q, N, D = q.shape
-    _, H_KV, _, _ = k.shape
+    _, H_KV, N_KV, _ = k.shape
     output = torch.empty_like(q)
 
-    # Normalize: when window covers the whole sequence, SWA degenerates to
+    # KV-cache / cross-length support: q may be a suffix of a longer KV
+    # stream (decode step: N=1, N_KV=cache len; prefill continuation:
+    # N=chunk, N_KV=past+chunk). kv_offset shifts the causal diagonal.
+    kv_offset = N_KV - N
+    assert kv_offset >= 0, \
+        f"KV sequence ({N_KV}) must be >= Q sequence ({N}) — q is the suffix"
+    assert v.shape[2] == N_KV
+
+    # Normalize: when window covers the whole KV sequence, SWA degenerates to
     # full causal. Take the full-causal path (skips window mask + NaN clamp).
-    if slide_size > 0 and slide_size >= N:
+    if slide_size > 0 and slide_size >= N_KV:
         slide_size = 0
 
     # Tuned defaults (sweeps in context/baseline.md). Block sizes scale inversely
@@ -631,8 +647,10 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
     if num_stages is None:
         num_stages = 2
 
-    BLOCK_Q = min(BLOCK_Q, triton.next_power_of_2(N))
-    BLOCK_KV = min(BLOCK_KV, triton.next_power_of_2(N))
+    # Floor of 16: tl.dot requires all matmul dims >= 16. Shorter sequences
+    # (e.g. single-token decode) run with masked padding rows/cols.
+    BLOCK_Q = max(16, min(BLOCK_Q, triton.next_power_of_2(N)))
+    BLOCK_KV = max(16, min(BLOCK_KV, triton.next_power_of_2(N_KV)))
 
     grid = (triton.cdiv(N, BLOCK_Q), B * H_Q)
 
@@ -640,6 +658,8 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
     if has_group_ids:
         assert group_lo is not None and group_hi_excl is not None, \
             "group_ids requires both group_lo and group_hi_excl"
+        assert kv_offset == 0, \
+            "image-group OR-mask is a training path; KV cache not supported"
         g_strides = (group_ids.stride(0), group_ids.stride(1))
     else:
         g_strides = (0, 0)
@@ -665,6 +685,7 @@ def attention_flash_gqa(q, k, v, causal=False, slide_size=0,
         GroupIds_ptr=group_ids, GroupLo_ptr=group_lo, GroupHi_ptr=group_hi_excl,
         stride_gb=g_strides[0], stride_gn=g_strides[1],
         HAS_GROUP_IDS=has_group_ids,
+        KV_OFFSET=kv_offset,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -1559,7 +1580,12 @@ class FlashAttnGQAFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, causal, slide_size, group_ids, group_lo, group_hi_excl):
         B, H_Q, N, D = q.shape
-        _, H_KV, _, _ = k.shape
+        _, H_KV, N_KV, _ = k.shape
+        assert N_KV == N, (
+            f"training path requires q_len == kv_len (got {N} vs {N_KV}); "
+            "cross-length (KV cache) attention is inference-only — use "
+            "flash_attn_gqa_train under no_grad or attention_flash_gqa directly"
+        )
         output = torch.empty_like(q)
         lse = torch.empty(B, H_Q, N, dtype=torch.float32, device=q.device)
 
@@ -1572,8 +1598,9 @@ class FlashAttnGQAFunction(torch.autograd.Function):
         BLOCK_D = D
         num_warps = 8 if D >= 256 else 4
         num_stages = 2
-        BLOCK_Q = min(BLOCK_Q, triton.next_power_of_2(N))
-        BLOCK_KV = min(BLOCK_KV, triton.next_power_of_2(N))
+        # Floor of 16: tl.dot minimum tile dim (tiny-N edge case).
+        BLOCK_Q = max(16, min(BLOCK_Q, triton.next_power_of_2(N)))
+        BLOCK_KV = max(16, min(BLOCK_KV, triton.next_power_of_2(N)))
         grid = (triton.cdiv(N, BLOCK_Q), B * H_Q)
 
         has_group_ids = group_ids is not None
@@ -1640,8 +1667,8 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 32, 64, 8
         else:
             BLOCK_Q_BW, BLOCK_KV_BW, num_warps_bw = 64, 64, 4
-        BLOCK_Q_BW = min(BLOCK_Q_BW, triton.next_power_of_2(N))
-        BLOCK_KV_BW = min(BLOCK_KV_BW, triton.next_power_of_2(N))
+        BLOCK_Q_BW = max(16, min(BLOCK_Q_BW, triton.next_power_of_2(N)))
+        BLOCK_KV_BW = max(16, min(BLOCK_KV_BW, triton.next_power_of_2(N)))
         grid_dq = (triton.cdiv(N, BLOCK_Q_BW), B * H_Q)
 
         _flash_attn_gqa_bwd_dq_kernel[grid_dq](
@@ -1704,8 +1731,8 @@ class FlashAttnGQAFunction(torch.autograd.Function):
             else:
                 BLOCK_KV_DKV, BLOCK_Q_DKV, num_warps_dkv = 32, 64, 4
                 num_stages_dkv = 2
-        BLOCK_KV_DKV = min(BLOCK_KV_DKV, triton.next_power_of_2(N))
-        BLOCK_Q_DKV = min(BLOCK_Q_DKV, triton.next_power_of_2(N))
+        BLOCK_KV_DKV = max(16, min(BLOCK_KV_DKV, triton.next_power_of_2(N)))
+        BLOCK_Q_DKV = max(16, min(BLOCK_Q_DKV, triton.next_power_of_2(N)))
 
         # Q_SPLITS: split each KV block's Q loop across multiple programs via
         # atomic_add, activated when the raw grid < target. Target differs by
@@ -1782,7 +1809,21 @@ def flash_attn_gqa_train(q, k, v, causal=False, slide_size=0,
         group_ids / group_lo / group_hi_excl: optional (B, N) int32 tensors
             enabling the image-bidirectional OR-mask path for Gemma-4
             multimodal training. See `attention_flash_gqa` for semantics.
+
+    Cross-length (KV cache) calls — q_len != kv_len, e.g. decode steps in
+    `model.generate()` — are inference-only and route to the forward kernel
+    directly (no LSE, no autograd graph).
     """
+    if k.shape[2] != q.shape[2]:
+        if torch.is_grad_enabled() and (
+            q.requires_grad or k.requires_grad or v.requires_grad
+        ):
+            raise NotImplementedError(
+                "cross-length (KV cache) attention has no backward; "
+                "run it under torch.no_grad()"
+            )
+        assert group_ids is None, "image-group OR-mask not supported with KV cache"
+        return attention_flash_gqa(q, k, v, causal=causal, slide_size=slide_size)
     return FlashAttnGQAFunction.apply(
         q, k, v, causal, slide_size, group_ids, group_lo, group_hi_excl,
     )
